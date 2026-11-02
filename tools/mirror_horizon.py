@@ -26,7 +26,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         source = root / 'source.git'
-        run('git', 'init', '--bare', str(source))
+        run('git', 'init', str(source))
         run('git', 'fetch', '--no-tags', UPSTREAM, '+refs/heads/main:refs/heads/horizon-upstream', '+refs/tags/nightly-source/*:refs/tags/nightly-source/*', cwd=source)
         upstream_sha = run('git', 'rev-parse', 'horizon-upstream', cwd=source)
         # Store the exact full history in a bundle, including original CI files.
@@ -108,4 +108,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
