@@ -1,0 +1,13 @@
+{
+  "game": {
+    "label": "horizon-build-2869ce6e524b0c3b840807bf",
+    "windows": {
+      "url": "https://github.com/Sl1ppyKlay/horizon-mirror/releases/download/horizon-build-2869ce6e524b0c3b840807bf/horizon-windows-x64.zip",
+      "sha256": "b942cd4c5ea42065a3fe2416210865450d5a41aa3bbe868d957bb3529970b59c"
+    },
+    "macos-arm64": {
+      "url": "https://github.com/Sl1ppyKlay/horizon-mirror/releases/download/horizon-build-2869ce6e524b0c3b840807bf/horizon-macos-arm64.zip",
+      "sha256": "09736c86faf52c3015c021c02d645fccbca1a0d830d01dcfd82345c05693c150"
+    }
+  }
+}
