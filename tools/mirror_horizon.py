@@ -28,12 +28,32 @@ def main():
         source = root / 'source.git'
         run('git', 'init', '--bare', str(source))
         run('git', 'fetch', '--no-tags', UPSTREAM, '+refs/heads/main:refs/heads/horizon-upstream', '+refs/tags/nightly-source/*:refs/tags/nightly-source/*', cwd=source)
-        # No force: rewritten upstream history must be reviewed; previous history survives.
-        run('git', 'push', f'https://github.com/{REPO}.git', 'refs/heads/horizon-upstream', 'refs/tags/*:refs/tags/*', cwd=source)
+        upstream_sha = run('git', 'rev-parse', 'horizon-upstream', cwd=source)
+        # Store the exact full history in a bundle, including original CI files.
+        bundle = root / 'horizon-history.bundle'
+        run('git', 'bundle', 'create', str(bundle), '--all', cwd=source)
+        run('git', 'bundle', 'verify', str(bundle), cwd=source)
+        # The browsable branch excludes executable CI. Never run upstream workflows.
+        run('git', 'read-tree', 'horizon-upstream', cwd=source)
+        workflows = run('git', 'ls-files', '.github/workflows', cwd=source).splitlines()
+        if workflows:
+            run('git', 'update-index', '--force-remove', '--', *workflows, cwd=source)
+        tree = run('git', 'write-tree', cwd=source)
+        remote = f'https://github.com/{REPO}.git'
+        previous = run('git', 'ls-remote', remote, 'refs/heads/horizon-upstream').split()
+        parents = []
+        if previous:
+            run('git', 'fetch', remote, 'refs/heads/horizon-upstream:refs/heads/previous', cwd=source)
+            parents = ['-p', previous[0]]
+        os.environ.update(GIT_AUTHOR_NAME='Horizon archive', GIT_AUTHOR_EMAIL='archive@users.noreply.github.com', GIT_COMMITTER_NAME='Horizon archive', GIT_COMMITTER_EMAIL='archive@users.noreply.github.com')
+        if not previous or run('git', 'rev-parse', 'previous^{tree}', cwd=source) != tree:
+            commit = run('git', 'commit-tree', tree, *parents, '-m', f'Archive upstream {upstream_sha} (original CI in history bundle)', cwd=source)
+            run('git', 'push', remote, f'{commit}:refs/heads/horizon-upstream', cwd=source)
         release = gh_json('api', 'repos/horizon-rust/horizon/releases/tags/nightly')
         assets = root / 'assets'
         assets.mkdir()
         run('gh', 'release', 'download', 'nightly', '--repo', 'horizon-rust/horizon', '--dir', str(assets))
+        bundle.replace(assets / 'horizon-history.bundle')
         sums = {}
         for line in (assets / 'SHA256SUMS').read_text().splitlines():
             sha, name = line.split(maxsplit=1)
@@ -52,7 +72,7 @@ def main():
         releases = gh_json('api', '--paginate', f'repos/{REPO}/releases?per_page=100')
         existing = next((r for r in releases if r['tag_name'] == tag), None)
         if existing and not existing['draft']:
-            expected = {p.name: p.stat().st_size for p in assets.iterdir()}
+            expected = {p.name: p.stat().st_size for p in assets.iterdir() if p.name != 'horizon-history.bundle'}
             actual = {a['name']: a['size'] for a in existing['assets']}
             if any(actual.get(n) != size for n, size in expected.items()):
                 raise ValueError('Published archive is incomplete; refusing to advertise it')

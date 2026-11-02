@@ -2,7 +2,7 @@
 
 Public backup of https://github.com/horizon-rust/horizon (MIT).
 
-- `horizon-upstream`: complete upstream main history and original source tree, with upstream tags.
+- `horizon-upstream`: upstream source snapshots, excluding executable `.github/workflows`. Exact original history, CI files and nightly source tags are preserved in each release’s `horizon-history.bundle` (restore with `git clone horizon-history.bundle`).
 - Releases: checksum-verified copies of all nightly assets, including source archives and original checksums/signature.
 - `main/manifest.json`: Blokky update manifest pointing to immutable archived release URLs.
 - Scheduled hourly, with manual dispatch. Old builds are never automatically deleted.
