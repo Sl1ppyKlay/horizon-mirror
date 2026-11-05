@@ -428,6 +428,7 @@ pub fn register(m: &mut Mob) {
         Family::Panda => super::panda::register(m),
         Family::PolarBear => super::polar_bear::register(m),
     }
+    native_register_goals(m);
     // FloatGoal's constructor lets the navigation float, as do the
     // constructors of these brain-driven and flying mobs. A floater rises
     // 0.04 a tick in Mob.jumpInLiquid, the others 0.3 (the bounce of #542).
@@ -444,6 +445,21 @@ pub fn register(m: &mut Mob) {
     {
         m.ai.nav.can_float = true;
     }
+}
+/// A new mob's goals (`Mob.registerGoals`): `mob.ai.goals` (vanilla's
+/// `goalSelector`) and `mob.ai.targets` (`targetSelector`) hold the goals of
+/// its species, which for a mod's type is its template's. Clear them to
+/// replace them, as a class whose `registerGoals` skips `super`'s, or add
+/// yours with `GoalSelector::add(priority, goal)`. Each mob gets its own
+/// goals, so a goal's fields are that mob's state while it lives (for state
+/// that is saved, see attachments on `Holder::Entity(mob.id)`). Asked for
+/// every mob Horizon makes, a client's copies of a server's mobs included,
+/// before its saved data is read; goals tick only where the mob's AI runs.
+/// `goals::Float` keeps the navigation floating, as FloatGoal's
+/// constructor does. API @API:register_goals@.
+#[inline(never)]
+pub fn native_register_goals(mob: &mut Mob) {
+    crate::native_client_hooks::register_goals(mob);
 }
 /// Mob.tick additions that run before the entity tick (cube/creeper fuses, puffing).
 fn pre_tick(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
@@ -1945,7 +1961,7 @@ fn species_ai_step(
         Species::Guardian | Species::ElderGuardian => super::guardian::ai_step(m, w, events),
         Species::Vex => super::vex::ai_step(m, w),
         Species::Ravager => super::ravager::ai_step(m, w, events),
-        Species::Wither => super::wither::ai_step(m, w, events),
+        Species::Wither => super::wither::ai_step(m, w, level_random, events),
         Species::Allay => super::allay::ai_step(m),
         Species::Bee => super::bee::ai_step(m, w),
         Species::PolarBear => super::polar_bear::ai_step(m, w),
