@@ -227,6 +227,7 @@ pub(super) struct GuestSwap {
         Option<u128>,
         Option<u8>,
         Option<u32>,
+        Option<i32>,
     ),
     /// That turn's other-player building boxes.
     building_boxes: BuildingPlayers,
@@ -424,6 +425,7 @@ impl Game<'_> {
             return None;
         }
         let i = host.hub.guests.iter().position(|g| g.conn == conn)?;
+        let spawn_protection = self.spawn_protection_for(host, host.hub.guests[i].uuid);
         // EntityGetter.isUnobstructed must still see other players while
         // the hub is taken out of self.lan. The outer body is live here;
         // its saved hub position (if any) belongs to a different turn.
@@ -646,6 +648,7 @@ impl Game<'_> {
             self.lan_acting_uuid.replace(g.uuid),
             self.lan_acting_permission.replace(g.permission),
             self.lan_acting_entity.replace(g.entity_id as u32),
+            std::mem::replace(&mut self.lan_acting_spawn_protection, spawn_protection),
         );
         // The damage hooks name the guest by UUID from here on.
         super::native_damage::note_player(g.entity_id, g.uuid);
@@ -934,6 +937,7 @@ impl Game<'_> {
             self.lan_acting_uuid,
             self.lan_acting_permission,
             self.lan_acting_entity,
+            self.lan_acting_spawn_protection,
         ) = acting;
         self.known_movement = known_movement;
         self.lan_building_boxes = building_boxes;
@@ -1376,12 +1380,13 @@ impl Game<'_> {
         };
         // The menu provider's getDisplayName: a container's custom name
         // (BaseContainerBlockEntity.getName) or its default name.
-        let custom = |k: (i32, i32, i32)| self.world.block_names.get(&k).map(String::as_str);
+        let custom = |k: (i32, i32, i32)| self.block_name_plain(k);
         let title = match slots {
             Slots::Ender => horizon_protocol::text::translatable("container.enderchest", &[]),
-            Slots::Double(first, second) => {
-                horizon_client::containers::double_chest_name(custom(first), custom(second))
-            }
+            Slots::Double(first, second) => horizon_client::containers::double_chest_name(
+                custom(first).as_deref(),
+                custom(second).as_deref(),
+            ),
             Slots::Block(k) => {
                 // A mod block's container is named after its block
                 // (`Block.getDescriptionId`).
@@ -1392,7 +1397,7 @@ impl Game<'_> {
                     }
                     None => return false,
                 };
-                horizon_client::containers::display_name(custom(k), &key)
+                horizon_client::containers::display_name(custom(k).as_deref(), &key)
             }
             // Opened by a mod (`native_open_menu`), never here.
             Slots::Native => return false,
@@ -1962,19 +1967,31 @@ impl Game<'_> {
     /// of the world spawn (square, in the Overworld) is.
     fn under_spawn_protection(&self, host: &LanHost, gi: usize, pos: [i32; 3]) -> bool {
         let g = &host.hub.guests[gi];
+        self.spawn_protection_for(host, g.uuid)
+            .is_some_and(|radius| self.spawn_protects(radius, &g.dimension, pos))
+    }
+
+    /// The part of `DedicatedServer.isUnderSpawnProtection` that depends on
+    /// the player: the radius that holds them back, None for an operator,
+    /// with no operators, a radius of 0 or less, or off a dedicated server.
+    fn spawn_protection_for(&self, host: &LanHost, uuid: u128) -> Option<i32> {
         let radius = host.hub.spawn_protection;
-        if self.options.dedicated.is_none() || radius <= 0 || g.dimension != "minecraft:overworld" {
-            return false;
-        }
+        (self.options.dedicated.is_some()
+            && radius > 0
+            && !host.hub.ops.is_empty()
+            && !host.hub.ops.contains_key(&uuid))
+        .then_some(radius)
+    }
+
+    /// The rest of it: a block in `dimension` within `radius` of the world
+    /// spawn (square, in the Overworld only).
+    pub(super) fn spawn_protects(&self, radius: i32, dimension: &str, pos: [i32; 3]) -> bool {
         let Some(spawn) = self.level.world_spawn else {
             return false;
         };
-        if host.hub.ops.is_empty() || host.hub.ops.contains_key(&g.uuid) {
-            return false;
-        }
         let dx = pos[0].abs_diff(spawn[0]);
         let dz = pos[2].abs_diff(spawn[2]);
-        dx.max(dz) <= radius as u32
+        dimension == "minecraft:overworld" && dx.max(dz) <= radius as u32
     }
 
     /// ServerPlayer.sendSpawnProtectionMessage.
@@ -3325,15 +3342,21 @@ impl Game<'_> {
             return;
         };
         let at = g.position;
+        let players = self.stab_players_for(host, conn);
         let sound = self
             .guest_hit_by(host, conn, |g| {
                 if g.cannot_attack_with_item(g.attack_ticks as i32, 5) {
                     None
                 } else {
-                    g.jab()
+                    let outer = std::mem::replace(&mut g.stab_players, players);
+                    let sound = g.jab();
+                    g.stab_players = outer;
+                    sound
                 }
             })
             .flatten();
+        // The players the jab stabbed, now that the hub is back.
+        self.land_player_stabs(host);
         // PiercingWeapon.makeSound: `playSound(causer, ...)`, so the guest's
         // own client plays it.
         if let Some(name) = sound {
@@ -4120,6 +4143,8 @@ impl Game<'_> {
         self.lan_merchant_tick(host);
         self.lan_stations_tick(host);
         self.lan_tables_tick(host);
+        self.lan_mod_crafting_tick(host);
+        self.lan_menu_links_tick(host);
         self.lan_containers_tick(host);
         self.tick_lan_mount_menus(host);
         self.tick_player_menus(host);
@@ -4180,7 +4205,14 @@ impl Game<'_> {
             let using = play.using.is_some();
             let delayed = play.destroy_delay > 0 || play.use_delay > 0 || play.attack_ticks < 100;
             if digging.is_some() || using || delayed {
+                // A spear in use reaches the other players too.
+                let players = if using {
+                    self.stab_players_for(host, conn)
+                } else {
+                    Vec::new()
+                };
                 self.as_guest(host, conn, |g| {
+                    let outer = std::mem::replace(&mut g.stab_players, players);
                     g.attack_ticks = g.attack_ticks.saturating_add(1);
                     if let Some((pos, face)) = digging {
                         g.forced_hit = Some(Hit {
@@ -4197,10 +4229,12 @@ impl Game<'_> {
                     g.forced_hit = None;
                     g.right = g.using.is_some();
                     g.tick_using();
+                    g.stab_players = outer;
                     if g.use_delay > 0 {
                         g.use_delay -= 1;
                     }
                 });
+                self.land_player_stabs(host);
                 // ServerPlayerGameMode.handleBlockBreakAction: creative and
                 // instant survival STARTs finish without a STOP from the client.
                 // tick_mining clears mining on completion; forget the START too,
