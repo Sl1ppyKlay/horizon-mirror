@@ -233,6 +233,8 @@ mod readback;
 mod resident;
 mod reuse;
 mod stars;
+mod surface_setup;
+use surface_setup::{AdapterChoice, AdapterFailure, open_adapter, pick_adapter, set_up_surface};
 pub mod submit;
 mod sunrise_fan;
 mod timing;
@@ -1934,6 +1936,47 @@ fn mip_chain(
     // Exactly the chain's size: cached animation frames count their capacity.
     let chain_bytes: usize = (0..levels).map(|l| layer_bytes >> (2 * l)).sum();
     let mut out = Vec::with_capacity(chain_bytes * layers as usize);
+    // Every layer makes its own mips from its own pixels, and a pack's array holds
+    // thousands of them: the layers run on every thread, in chunks so a worker
+    // allocates one chain per chunk rather than one per layer. The chunks are
+    // appended in order, so the chain stays layer major.
+    const LAYERS_PER_CHUNK: u32 = 16;
+    let chunks: Vec<(u32, u32)> = (0..layers)
+        .step_by(LAYERS_PER_CHUNK as usize)
+        .map(|start| (start, (layers - start).min(LAYERS_PER_CHUNK)))
+        .collect();
+    let parts = crate::par::par_map(&chunks, |&(start, count)| {
+        mip_chain_layers(
+            &pixels[start as usize * layer_bytes..],
+            size,
+            settings,
+            first + start,
+            count,
+            levels - 1,
+            layer_bytes,
+        )
+    });
+    for part in parts {
+        out.extend_from_slice(&part);
+    }
+    debug_assert_eq!(out.len(), chain_bytes * layers as usize);
+    (out, levels)
+}
+
+/// The mip chain of `layers` layers from `pixels` that start at layer `first`:
+/// `layers`' base levels followed by their reductions, layer major.
+fn mip_chain_layers(
+    pixels: &[u8],
+    size: u32,
+    settings: &[crate::mipmap::Settings],
+    first: u32,
+    layers: u32,
+    levels: u32,
+    layer_bytes: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        (0..=levels).map(|l| layer_bytes >> (2 * l)).sum::<usize>() * layers as usize,
+    );
     for layer in 0..layers as usize {
         let base = crate::mipmap::Image {
             width: size,
@@ -1950,7 +1993,7 @@ fn mip_chain(
         let has_transparent = s.has_transparent || base.pixels.iter().any(|p| p[3] == 0);
         for image in crate::mipmap::generate(
             base,
-            levels - 1,
+            levels,
             crate::mipmap::Settings {
                 has_transparent,
                 ..s
@@ -1959,8 +2002,7 @@ fn mip_chain(
             out.extend(image.pixels.iter().flatten());
         }
     }
-    debug_assert_eq!(out.len(), chain_bytes * layers as usize);
-    (out, levels)
+    out
 }
 /// The wgpu instance options, without wgpu's validation of indirect draws
 /// in release builds. That validation (meant for untrusted WebGPU content)
@@ -2038,7 +2080,7 @@ impl wgpu::rwh::HasDisplayHandle for WindowDisplay {
 }
 /// The backends to open a device on, each tried in turn until one gives a
 /// device. `api` is the player's choice (`GraphicsApi::with_env` applied);
-/// `os` is `std::env::consts::OS`; `arch` the machine's (`system::machine_arch`), not the
+/// `os` is `std::env::consts::OS`; `arch` the machine's (`horizon_system::machine_arch`), not the
 /// build's; `wgpu_backend`: whether `WGPU_BACKEND` is set, which picks the backends itself.
 /// Auto tries DirectX 12 first on Windows ARM64, the x64 build emulated there included,
 /// then Vulkan, based on the device losses seen there (#7513). Other
@@ -2089,8 +2131,41 @@ struct Opened {
     device: wgpu::Device,
     queue: wgpu::Queue,
     device_lost: Arc<std::sync::atomic::AtomicBool>,
+    /// The window surface's configuration, set on `device` during the search, and the
+    /// surface's capabilities on `adapter`. None offscreen.
+    configured: Option<(wgpu::SurfaceConfiguration, wgpu::SurfaceCapabilities)>,
 }
-/// Logs the adapter and records it for telemetry and crash reports.
+/// The adapter as the renderer found it ([`adapter`]): for the crash report, and for whoever
+/// describes the machine (telemetry, through an extension of the game).
+#[derive(Clone, Debug, Default)]
+pub struct Adapter {
+    pub name: String,
+    pub vendor: String,
+    /// `integrated`, `discrete`, `virtual`, `cpu` or `other`.
+    pub kind: String,
+    pub driver: String,
+    pub backend: String,
+}
+
+static ADAPTER: std::sync::Mutex<Option<Adapter>> = std::sync::Mutex::new(None);
+
+/// The adapter, once the renderer has one.
+pub fn adapter() -> Option<Adapter> {
+    ADAPTER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// wgpu's device type in the words reports use.
+pub fn gpu_kind(device_type: &str) -> &'static str {
+    match device_type {
+        "IntegratedGpu" => "integrated",
+        "DiscreteGpu" => "discrete",
+        "VirtualGpu" => "virtual",
+        "Cpu" => "cpu",
+        _ => "other",
+    }
+}
+
+/// Logs the adapter and records it ([`adapter`]) for crash reports and telemetry.
 fn describe_adapter(adapter: &wgpu::Adapter) {
     let info = adapter.get_info();
     log::info!(
@@ -2099,10 +2174,10 @@ fn describe_adapter(adapter: &wgpu::Adapter) {
         info.backend,
         info.device_type
     );
-    crate::telemetry::set_gpu(crate::telemetry::Gpu {
+    *ADAPTER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Adapter {
         name: info.name.clone(),
-        vendor: horizon_telemetry::system::gpu_vendor(&info.name, info.vendor).to_owned(),
-        kind: crate::telemetry::gpu_kind(&format!("{:?}", info.device_type)).to_owned(),
+        vendor: horizon_system::gpu_vendor(&info.name, info.vendor).to_owned(),
+        kind: gpu_kind(&format!("{:?}", info.device_type)).to_owned(),
         driver: format!("{} {}", info.driver, info.driver_info)
             .trim()
             .to_owned(),
@@ -2289,7 +2364,7 @@ async fn open_device(
         api.with_env(),
         std::env::consts::OS,
         // The machine's: the x64 build emulated on a Windows ARM64 PC has its GPU too (#7513).
-        horizon_telemetry::system::machine_arch(),
+        horizon_system::machine_arch(),
         wgpu_backend,
     ) {
         match open_device_with(window, offscreen, &order, layers, allow_cpu).await {
@@ -2484,91 +2559,57 @@ async fn open_backend(
             },
         );
     }
-    describe_adapter(&adapter);
-    let info = adapter.get_info();
-    let limits = adapter.limits();
-    if let Err(e) = check_layers(&adapter, layers) {
-        return Err(NoDevice::Failed(format!("{name}: {e}")));
-    }
-    // Mappable primary buffers: section pages that no longer fit in
-    // video memory go to system memory. Shader packs' 16-bit normalized buffers (render
-    // targets with the adapter's own format features) and R11F_G11F_B10F: a float
-    // stand-in neither clamps nor drops NaN. Subgroups: shader packs' compute programs
-    // (`MC_GL_KHR_shader_subgroup_*`); storage buffers in vertex shaders, clearing and
-    // atomics on images: their buffers and images. Filtering 32-bit float textures: shader
-    // packs' RGBA32F buffers, which GL filters and mipmaps. Count draws: GPU culling's (`gpu_culling`).
-    let features = timing::GpuTimer::features(&adapter)
-        | cull::Cull::features(&adapter)
-        | oit::features(&adapter)
-        | (adapter.features()
-            & (wgpu::Features::INDIRECT_FIRST_INSTANCE
-                | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
-                | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
-                | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-                | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-                | wgpu::Features::RG11B10UFLOAT_RENDERABLE
-                | wgpu::Features::SUBGROUP
-                | wgpu::Features::VERTEX_WRITABLE_STORAGE
-                | wgpu::Features::CLEAR_TEXTURE
-                | wgpu::Features::TEXTURE_ATOMIC
-                | wgpu::Features::FLOAT32_FILTERABLE));
-    let driver = format!("{} {}", info.driver, info.driver_info);
-    startup_step(format_args!(
-        "requesting the device (driver {}) with features [{features}] and the adapter's \
-         limits (buffers up to {} bytes, storage bindings up to {} bytes, {} texture layers)",
-        match driver.trim() {
-            "" => "unnamed",
-            driver => driver,
-        },
-        limits.max_buffer_size,
-        limits.max_storage_buffer_binding_size,
-        limits.max_texture_array_layers,
-    ));
-    let desc = wgpu::DeviceDescriptor {
-        label: Some("Horizon device"),
-        required_features: features,
-        required_limits: limits,
-        // Video memory in blocks of 8-64 MiB instead of 128-256 MiB (Vulkan and DirectX 12):
-        // with the larger blocks a few small buffers kept whole blocks the arena's pages had
-        // left, and over half the video memory reserved was unused (1,344 MiB for 500).
-        memory_hints: wgpu::MemoryHints::MemoryUsage,
-        ..Default::default()
-    };
-    #[cfg(not(target_os = "macos"))]
-    let opened = match info.backend {
-        wgpu::Backend::Vulkan => horizon_hdr::open_vulkan_device(&adapter, &desc),
-        _ => None,
-    };
-    #[cfg(target_os = "macos")]
-    let opened = None;
-    let opened = match opened {
-        Some(opened) => opened,
-        None => adapter.request_device(&desc).await,
-    };
-    match opened {
-        Ok((device, queue)) => {
-            let device_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let lost = device_lost.clone();
-            device.set_device_lost_callback(move |reason, message| {
-                // A device destroyed on purpose was not lost.
-                if reason == wgpu::DeviceLostReason::Destroyed {
-                    return;
-                }
-                log::warn!(
-                    "Horizon renderer: the graphics device was lost ({reason:?}: {message})"
-                );
-                lost.store(true, std::sync::atomic::Ordering::Relaxed);
-            });
-            Ok(Opened {
-                instance,
-                surface,
-                adapter,
-                device,
-                queue,
-                device_lost,
+    // Adapters that could not present to the window: the next one of this backend
+    // that can is tried before the next backend (#13493).
+    let mut tried = Vec::new();
+    let mut adapter = adapter;
+    loop {
+        let why = match open_adapter(name, window, surface.as_ref(), &adapter, layers).await {
+            Ok(adapted) => {
+                return Ok(Opened {
+                    instance,
+                    surface,
+                    adapter,
+                    device: adapted.device,
+                    queue: adapted.queue,
+                    device_lost: adapted.device_lost,
+                    configured: adapted.configured,
+                });
+            }
+            Err(AdapterFailure::Failed(e)) => return Err(NoDevice::Failed(e)),
+            Err(AdapterFailure::CannotPresent(why)) => why,
+        };
+        let info = adapter.get_info();
+        tried.push(info.clone());
+        let others = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        let choices: Vec<_> = others
+            .iter()
+            .map(|other| AdapterChoice {
+                kind: other.get_info().device_type,
+                presents: surface
+                    .as_ref()
+                    .is_some_and(|s| !s.get_capabilities(other).formats.is_empty()),
+                tried: tried.contains(&other.get_info()),
             })
-        }
-        Err(e) => Err(NoDevice::Failed(format!("{name} device: {e}"))),
+            .collect();
+        let Some(next) = pick_adapter(&choices, allow_cpu) else {
+            log::warn!(
+                "Horizon renderer: skipping {} on {name}: it can't present to the window \
+                 ({why}), and no other {name} adapter can",
+                info.name
+            );
+            return Err(NoDevice::Failed(format!(
+                "{name}: {} can't present to the window ({why})",
+                info.name
+            )));
+        };
+        adapter = others[next].clone();
+        log::warn!(
+            "Horizon renderer: skipping {} on {name}: it can't present to the window ({why}); \
+             trying {}",
+            info.name,
+            adapter.get_info().name
+        );
     }
 }
 /// A surface for `window` (none `offscreen`) and the adapter `open_backend`
@@ -2853,6 +2894,7 @@ impl Renderer {
             device,
             queue,
             device_lost,
+            configured,
         } = match previous {
             // Reload resources on the same device; replacing live Vulkan
             // devices can invalidate the driver's swapchain state on the same
@@ -2879,6 +2921,7 @@ impl Renderer {
                     device: renderer.device.clone(),
                     queue: renderer.queue.clone(),
                     device_lost: renderer.device_lost.clone(),
+                    configured: None,
                 }
             }
             None => {
@@ -2896,42 +2939,21 @@ impl Renderer {
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
         let size = window.inner_size();
         let max_side = device.limits().max_texture_dimension_2d;
-        let (config, present_modes, hdr_output) = if let Some(surface) = &surface {
-            let mut config = surface
-                .get_default_config(
-                    &adapter,
-                    size.width.clamp(1, max_side),
-                    size.height.clamp(1, max_side),
-                )
-                .ok_or("surface has no supported configuration")?;
-            let caps = surface.get_capabilities(&adapter);
-            config.format = surface_format(&caps.formats, config.format);
-            config.view_formats = vec![config.format.remove_srgb_suffix()];
-            // Screenshots copy the presented frame back from the swapchain, frame
-            // generation's present thread copies its frames in.
-            if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
-                config.usage |= wgpu::TextureUsages::COPY_SRC;
-            }
-            if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
-                config.usage |= wgpu::TextureUsages::COPY_DST;
-            }
-            config.present_mode = previous
-                .map(|renderer| renderer.config.present_mode)
-                .filter(|mode| caps.present_modes.contains(mode))
-                .unwrap_or_else(|| {
-                    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-                        wgpu::PresentMode::Mailbox
-                    } else {
-                        wgpu::PresentMode::Fifo
-                    }
-                });
-            if previous.is_none() {
-                startup_step(format_args!(
-                    "device ready; configuring the surface ({}x{} {:?}, {:?})",
-                    config.width, config.height, config.format, config.present_mode
-                ));
-            }
-            surface.configure(&device, &config);
+        let configured = match (&surface, configured) {
+            (Some(_), Some(configured)) => Some(configured),
+            (Some(surface), None) => Some(set_up_surface(
+                surface,
+                &adapter,
+                &device,
+                &device_lost,
+                surface.get_capabilities(&adapter),
+                size,
+                previous.map(|renderer| renderer.config.present_mode),
+                previous.is_none(),
+            )?),
+            (None, _) => None,
+        };
+        let (config, present_modes, hdr_output) = if let Some((config, caps)) = configured {
             let hdr_output = hdr::output(&caps);
             crate::graphics::offer_hdr(hdr_output.is_some());
             if previous.is_none() {
@@ -2940,7 +2962,7 @@ impl Renderer {
                     hdr_output.map_or("not offered by this display", hdr::Output::name)
                 );
             }
-            (config, caps.present_modes.clone(), hdr_output)
+            (config, caps.present_modes, hdr_output)
         } else {
             let format = wgpu::TextureFormat::Bgra8Unorm;
             let config = wgpu::SurfaceConfiguration {
@@ -3880,6 +3902,7 @@ impl Renderer {
             overlay_format,
             &atlas_view,
             &glint_view,
+            &glint_armor_view,
             &glint_sampler,
             hud_coverage,
         )?;
@@ -7050,13 +7073,7 @@ impl Renderer {
             return Err("the graphics device was lost".into());
         }
         if let Some(hdr) = hdr {
-            horizon_hdr::set_metadata(
-                device,
-                surface,
-                hdr.paper_white,
-                hdr.declared_peak(),
-                hdr.black,
-            );
+            horizon_hdr::set_metadata(device, surface, hdr.declared_peak(), hdr.black);
         }
         Ok(())
     }
@@ -7094,13 +7111,7 @@ impl Renderer {
     }
     fn send_hdr_metadata(&self) {
         if let (Some(surface), Some(hdr)) = (&self.surface, &self.hdr) {
-            horizon_hdr::set_metadata(
-                &self.device,
-                surface,
-                hdr.paper_white,
-                hdr.declared_peak(),
-                hdr.black,
-            );
+            horizon_hdr::set_metadata(&self.device, surface, hdr.declared_peak(), hdr.black);
         }
     }
     /// The swapchain's configuration: `config` (what every pipeline draws in), or
@@ -8216,10 +8227,14 @@ impl Renderer {
             config.view_formats = vec![self.frame_format];
             config.usage |= wgpu::TextureUsages::TEXTURE_BINDING;
         }
+        // The layered float frame keeps HDR: its world's light and HUD layer make the picture
+        // (`Hdr::sdr_screenshot`), in HDR's own targets at `size`; it presents nothing, as the
+        // swapchain is set aside. Other frames draw without HDR, into a target of their own.
+        let layered = self.hdr.as_ref().is_some_and(hdr::Hdr::layered);
         // Out of video memory (an invalid texture's view is a validation error):
         // tried again at half the size next frame; the window keeps its last one.
         let checks = GpuChecks::push(&self.device);
-        let target = Self::offscreen_target(&self.device, &config);
+        let target = (!layered).then(|| Self::offscreen_target(&self.device, &config));
         let depth = Self::depth(&self.device, &config);
         if let Some(e) = checks.pop() {
             log::warn!(
@@ -8235,15 +8250,22 @@ impl Renderer {
         self.hud.zoom = size[0] as f32 / window[0] as f32;
         [self.config.width, self.config.height] = size;
         let surface = self.surface.take();
-        // HDR presents to the swapchain; this frame goes to a file.
-        let hdr = self.hdr.take();
-        let offscreen = self.offscreen.replace(target);
+        let hdr = self.hdr.take_if(|_| !layered);
+        let offscreen = std::mem::replace(&mut self.offscreen, target);
         let window_depth = std::mem::replace(&mut self.depth, depth);
         // The frame's own targets at `size` can run out of memory too.
         let drawn = self.draw_frame(frame, Some(GpuChecks::push(&self.device)));
         self.depth = window_depth;
         self.offscreen = offscreen;
-        self.hdr = hdr;
+        match hdr {
+            Some(hdr) => self.hdr = Some(hdr),
+            // Not kept for the window, which makes its own at its size next frame.
+            None => {
+                if let Some(hdr) = &mut self.hdr {
+                    hdr.release_targets();
+                }
+            }
+        }
         self.surface = surface;
         [self.config.width, self.config.height] = window;
         self.hud.zoom = 1.0;
@@ -12876,12 +12898,12 @@ impl Renderer {
         Ok([width, height])
     }
     /// The HDR10 copy (`Hdr::capture`) as a 16-bit PNG tagged BT.2020 with PQ (cICP, PNG's
-    /// third edition), with the peak and paper white as its content light levels (cLLI), and
+    /// third edition), with the content light levels its pixels hold (cLLI), and
     /// an ICC profile for the programs that don't read cICP (`hdr_icc`).
     fn write_hdr_screenshot(&self, path: &std::path::Path, buffer: &wgpu::Buffer) -> Result<()> {
-        let Some(hdr) = &self.hdr else {
+        if self.hdr.is_none() {
             return Ok(());
-        };
+        }
         let pixels = hdr10_to_rgb16(&self.read_frame(buffer)?);
         let mut info = png::Info::with_size(self.config.width, self.config.height);
         info.color_type = png::ColorType::Rgb;
@@ -12892,12 +12914,7 @@ impl Renderer {
         let mut writer = encoder.write_header()?;
         // BT.2020 primaries, PQ, RGB, full range.
         writer.write_chunk(png::chunk::cICP, &[9, 16, 0, 1])?;
-        let nits = |n: f32| ((n * 10_000.0) as u32).to_be_bytes();
-        let peak = hdr.peak.max(hdr.paper_white);
-        writer.write_chunk(
-            png::chunk::cLLI,
-            &[nits(peak), nits(hdr.paper_white.min(peak))].concat(),
-        )?;
+        writer.write_chunk(png::chunk::cLLI, &hdr_icc::content_light_levels(&pixels))?;
         writer.write_image_data(&pixels)?;
         Ok(())
     }
@@ -13866,14 +13883,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_black_level_rounds_down() {
-        use super::hundredths_of_a_nit as h;
-        assert_eq!(h(0.005), 0);
-        assert_eq!(h(0.05), 5);
-        assert_eq!(h(5.0), 100);
-        assert_eq!(h(f32::NAN), 0);
-    }
-    #[test]
     fn os_luminances_become_auto_values() {
         use super::os_reported;
         use crate::graphics::Reported;
@@ -13891,7 +13900,6 @@ mod tests {
             Some(Reported {
                 paper_white: 240,
                 peak: 998,
-                black: 0
             })
         );
         assert_eq!(
@@ -13899,7 +13907,6 @@ mod tests {
             Some(Reported {
                 paper_white: 480,
                 peak: 480,
-                black: 0
             })
         );
         // White above the calibrated peak (a Samsung QD-OLED's 380, the slider at 456).
@@ -13908,7 +13915,6 @@ mod tests {
             Some(Reported {
                 paper_white: 456,
                 peak: 456,
-                black: 0
             })
         );
         assert_eq!(os_reported(&info(Some(1000.0), None)), None);
@@ -15289,6 +15295,67 @@ mod sprite_upload_tests {
         }
     }
 
+    /// The chains are made a chunk of layers at a time, each on its own thread. Their
+    /// bytes must be the ones one thread making every layer in turn gives, in layer
+    /// order, whichever layer a chunk starts at.
+    #[test]
+    fn mip_chains_match_one_thread_making_every_layer() {
+        let size: u32 = 8;
+        let layers: u32 = 40;
+        let pixels: Vec<u8> = (0..size * size * layers)
+            .flat_map(|i| [i as u8, (i * 7) as u8, 33, if i % 5 == 0 { 0 } else { 255 }])
+            .collect();
+        let settings: Vec<_> = (0..layers)
+            .map(|i| crate::mipmap::Settings {
+                strategy: match i % 3 {
+                    0 => crate::mipmap::Strategy::Mean,
+                    1 => crate::mipmap::Strategy::Cutout,
+                    _ => crate::mipmap::Strategy::DarkCutout,
+                },
+                alpha_cutoff_bias: (i % 4) as f32 / 4.0,
+                item: i % 7 == 0,
+                ..Default::default()
+            })
+            .collect();
+        let layer_bytes = (size * size * 4) as usize;
+        let levels = size.trailing_zeros();
+        let chain_bytes: usize = (0..=levels).map(|l| layer_bytes >> (2 * l)).sum();
+        let mut expected: Vec<u8> = Vec::new();
+        for (layer, s) in settings.iter().copied().enumerate() {
+            let base = crate::mipmap::Image {
+                width: size,
+                height: size,
+                pixels: pixels[layer * layer_bytes..(layer + 1) * layer_bytes]
+                    .as_chunks::<4>()
+                    .0
+                    .to_vec(),
+            };
+            let has_transparent = s.has_transparent || base.pixels.iter().any(|p| p[3] == 0);
+            for image in crate::mipmap::generate(
+                base,
+                levels,
+                crate::mipmap::Settings {
+                    has_transparent,
+                    ..s
+                },
+            ) {
+                expected.extend(image.pixels.iter().flatten());
+            }
+        }
+        assert_eq!(expected.len(), chain_bytes * layers as usize);
+        assert_eq!(mip_chain(&pixels, size, &settings, 0, layers).0, expected);
+        // From the middle: the chunk's settings still come from the global layer index.
+        let from = (layers / 2) as usize;
+        let chain = mip_chain(
+            &pixels[from * layer_bytes..],
+            size,
+            &settings,
+            from as u32,
+            layers / 2,
+        );
+        assert_eq!(chain.0, expected[from * chain_bytes..]);
+    }
+
     #[test]
     fn sprite_split_follows_the_adapters_layer_limit() {
         // The Discord report: 512 layers per array, 1291 block textures (3 arrays).
@@ -15538,15 +15605,6 @@ fn flush_display_log() {
         (log.last, log.at) = (line, Some(now));
     }
 }
-/// A reported black level, within the setting's range. Rounded down: OLEDs report a figure
-/// just above 0, like KWin's 0.005, which isn't worth lifting the shadows for.
-fn hundredths_of_a_nit(nits: f32) -> u32 {
-    if nits.is_finite() && nits > 0.0 {
-        ((nits * 100.0) as u32).min(100)
-    } else {
-        0
-    }
-}
 fn log_os_reported(reported: Option<crate::graphics::Reported>) {
     log_display(match reported {
         Some(r) => format!(
@@ -15569,7 +15627,6 @@ fn os_reported(info: &wgpu::DisplayHdrInfo) -> Option<crate::graphics::Reported>
     let paper_white = (white.round() as u32).clamp(80, 480);
     Some(crate::graphics::Reported {
         paper_white,
-        black: hundredths_of_a_nit(luminance.min_nits.unwrap_or(0.0)),
         // Windows' SDR brightness slider can set white above the reported peak (480 against
         // a calibrated 380): the highlights then stay at white instead of dropping below it.
         peak: (peak.round() as u32).clamp(200, 10_000).max(paper_white),
@@ -15608,7 +15665,6 @@ fn reported(l: horizon_hdr::wayland::Luminances) -> crate::graphics::Reported {
     crate::graphics::Reported {
         paper_white: 203,
         peak: peak.clamp(200, 10_000),
-        black: hundredths_of_a_nit(l.target_min * 203.0 / l.reference.max(1.0)),
     }
 }
 

@@ -598,26 +598,13 @@ fn read_ticks(
 fn fluid_name(kind: u32) -> Option<String> {
     use horizon_world::fluid::FluidKind;
     let fluid = *FluidKind::ALL.get(kind as usize)?;
-    Some(
-        match fluid {
-            FluidKind::Empty => return None,
-            FluidKind::FlowingWater => "minecraft:flowing_water",
-            FluidKind::Water => "minecraft:water",
-            FluidKind::FlowingLava => "minecraft:flowing_lava",
-            FluidKind::Lava => "minecraft:lava",
-        }
-        .to_owned(),
-    )
+    (fluid != FluidKind::Empty).then(|| fluid.name().to_owned())
 }
 fn fluid_id(name: &str) -> Option<u32> {
     use horizon_world::fluid::FluidKind;
-    Some(match name {
-        "minecraft:flowing_water" => FluidKind::FlowingWater,
-        "minecraft:water" => FluidKind::Water,
-        "minecraft:flowing_lava" => FluidKind::FlowingLava,
-        "minecraft:lava" => FluidKind::Lava,
-        _ => return None,
-    } as u32)
+    FluidKind::from_name(name)
+        .filter(|kind| *kind != FluidKind::Empty)
+        .map(|kind| kind.index() as u32)
 }
 
 pub use horizon_items::item_nbt::{
@@ -625,7 +612,7 @@ pub use horizon_items::item_nbt::{
 };
 /// The block entity type ID for the block it sits in (a chest-like container
 /// is a chest, trapped chest or barrel).
-fn block_entity_id(e: &crate::containers::BlockEntity, block: &str) -> String {
+pub fn block_entity_id(e: &crate::containers::BlockEntity, block: &str) -> String {
     match (e, block) {
         (
             crate::containers::BlockEntity::Chest(_),

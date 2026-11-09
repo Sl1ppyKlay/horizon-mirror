@@ -3,6 +3,7 @@
 //! GUI scale is applied when drawing).
 use crate::Result;
 use horizon_assets::animation::AnimationMetadata;
+use smallvec::SmallVec;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -13,6 +14,7 @@ use wgpu::util::DeviceExt;
 
 pub mod cit_glint;
 mod pack_text;
+pub(crate) mod sprite_modifiers;
 
 /// A sprite's atlas region, and its size in GUI pixels: the size of the
 /// default resources' texture of that name, whatever the resolution of the
@@ -103,6 +105,8 @@ pub struct HudAtlas {
     /// The packs' `core/sky` and `core/stars`, when a pack replaces them.
     pub sky_shader: Option<std::sync::Arc<horizon_shaders::CoreProgram>>,
     pub stars_shader: Option<std::sync::Arc<horizon_shaders::CoreProgram>>,
+    /// The packs' Polytone screen sprite modifiers.
+    pub sprite_modifiers: std::sync::Arc<sprite_modifiers::SpriteModifiers>,
     /// The packs' OptiFine random entity textures, whose variants this atlas packs.
     pub random_textures: horizon_optifine::random_textures::RandomTextures,
     /// Their emissive overlays (`_e`), packed here too.
@@ -112,7 +116,8 @@ pub struct HudAtlas {
     /// Of the shared atlas's textures, their LabPBR normal and specular maps as paged maps
     /// (`paged_maps.rs`), read while loading for shader packs (`sprites::labpbr_maps`).
     pub material_maps: std::sync::Arc<[Option<crate::paged_maps::PagedMap>; 2]>,
-    white: Rect,
+    /// The white texel flat fills sample (also `hud_kit::shapes`).
+    pub(crate) white: Rect,
 }
 /// Atlas rows reserved for glyphs rasterized at run time.
 pub const GLYPH_ROWS: u32 = 512;
@@ -886,18 +891,11 @@ impl HudAtlas {
     /// mods holds none of them.
     pub fn build_over_with_image(root: &Path, defaults: &Path, mod_image: bool) -> Result<Self> {
         let mut atlas = Self::pack(root, defaults, WALKED_TEXTURE_FOLDERS, true, mod_image)?;
-        atlas.text_shader = pack_text::load(root, defaults);
-        atlas.lines_shader = pack_text::load_core(
+        pack_text::load_shaders(&mut atlas, root, defaults);
+        atlas.sprite_modifiers = std::sync::Arc::new(sprite_modifiers::SpriteModifiers::read(
             root,
-            defaults,
-            "rendertype_lines",
-            &[],
-            &crate::gfx::core_lines::GLUE,
-        );
-        let sky =
-            |name| pack_text::load_core(root, defaults, name, &[], &crate::gfx::core_sky::GLUE);
-        atlas.sky_shader = sky("sky");
-        atlas.stars_shader = sky("stars");
+            atlas.sprites.keys(),
+        ));
         Ok(atlas)
     }
     /// Empty slots written at run time: map textures (game/maps.rs), the
@@ -980,6 +978,7 @@ impl HudAtlas {
             lines_shader: None,
             sky_shader: None,
             stars_shader: None,
+            sprite_modifiers: Default::default(),
             random_textures: Default::default(),
             emissive: Arc::default(),
             blinks: Default::default(),
@@ -1047,6 +1046,7 @@ impl HudAtlas {
             lines_shader: None,
             sky_shader: None,
             stars_shader: None,
+            sprite_modifiers: Default::default(),
             random_textures: Default::default(),
             emissive: Default::default(),
             blinks: Default::default(),
@@ -1625,6 +1625,7 @@ impl HudAtlas {
             lines_shader: None,
             sky_shader: None,
             stars_shader: None,
+            sprite_modifiers: Default::default(),
             random_textures,
             emissive,
             blinks,
@@ -1672,6 +1673,8 @@ fn clip_polygon(poly: &[HudVertex], axis: usize, limit: f32, keep_below: bool) -
         v.pos = [mix(a.pos[0], b.pos[0]), mix(a.pos[1], b.pos[1])];
         v.uv = [mix(a.uv[0], b.uv[0]), mix(a.uv[1], b.uv[1])];
         v.depth = mix(a.depth, b.depth);
+        // A shaded shape (a gradient, `hud_kit::shapes`) keeps its colours across the cut.
+        v.color = crate::hud_kit::shapes::mix_colour(a.color, b.color, t);
         v.glint_uv = [
             mix(a.glint_uv[0], b.glint_uv[0]),
             mix(a.glint_uv[1], b.glint_uv[1]),
@@ -1687,11 +1690,8 @@ fn clip_polygon(poly: &[HudVertex], axis: usize, limit: f32, keep_below: bool) -
             out.push(*a);
         }
         if ia != ib {
-            out.push(lerp(
-                a,
-                b,
-                (limit - a.pos[axis]) / (b.pos[axis] - a.pos[axis]),
-            ));
+            let t = (limit - a.pos[axis]) / (b.pos[axis] - a.pos[axis]);
+            out.push(lerp(a, b, t));
         }
     }
     out
@@ -1733,6 +1733,10 @@ pub enum Blend {
     Additive,
     /// Alpha blending with an isolated depth buffer and a pixel scissor.
     Depth([u32; 4]),
+    /// The glint over the `Depth` run before it with the same scissor, in its
+    /// pass: `RenderPipelines.GLINT`'s additive blend, depth tested against the
+    /// model and never written.
+    DepthGlint([u32; 4]),
     /// `RenderPipelines.VIGNETTE`: the destination darkened by the texture
     /// (`ZERO, ONE_MINUS_SRC_COLOR`).
     Vignette,
@@ -1750,8 +1754,8 @@ pub struct EndPortalFill {
     pub sprites: [[f32; 4]; 2],
     pub game_time: f32,
 }
-pub fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
-    u32::from(a) << 24 | u32::from(b) << 16 | u32::from(g) << 8 | u32::from(r)
+pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    (a as u32) << 24 | (b as u32) << 16 | (g as u32) << 8 | r as u32
 }
 impl HudBatch {
     /// Window.calculateScale: the largest scale keeping >= 320x240 GUI pixels,
@@ -1830,12 +1834,31 @@ impl HudBatch {
         }
         out
     }
-    fn runs_in(&self, vertices: std::ops::Range<u32>) -> Vec<(std::ops::Range<u32>, Blend)> {
-        let mut runs = self.runs();
-        for (range, _) in &mut runs {
-            *range = range.start.max(vertices.start)..range.end.min(vertices.end);
+    fn runs_in(
+        &self,
+        vertices: std::ops::Range<u32>,
+    ) -> SmallVec<[(std::ops::Range<u32>, Blend); 16]> {
+        let mut runs = SmallVec::new();
+        let mut at = vertices.start;
+        for (range, blend) in &self.blends {
+            if range.start > at {
+                let start = at.max(vertices.start);
+                let end = range.start.min(vertices.end);
+                if start < end {
+                    runs.push((start..end, Blend::Alpha));
+                }
+            }
+            let start = range.start.max(vertices.start);
+            let end = range.end.min(vertices.end);
+            if start < end {
+                runs.push((start..end, *blend));
+            }
+            at = at.max(range.end);
         }
-        runs.retain(|(range, _)| !range.is_empty());
+        let end = (self.vertices.len() as u32).min(vertices.end);
+        if at < end {
+            runs.push((at.max(vertices.start)..end, Blend::Alpha));
+        }
         runs
     }
     /// `AbstractContainerScreen.init`: center in integer GUI coordinates.
@@ -1889,8 +1912,39 @@ impl HudBatch {
             });
         }
     }
+    /// `RenderTypes.armorCutoutNoCullGlint` (and the items' glint types) over a
+    /// [`Self::quad_3d`] face: `uv` is the face's atlas UV,
+    /// which the shader masks by, and `glint_uv` the transformed glint UV.
+    /// `armor` samples `enchanted_glint_armor` (`ARMOR_ENTITY_GLINT`), otherwise
+    /// `enchanted_glint_item`. Drawn by [`Self::depth_glint_since`].
+    pub fn quad_3d_glint(
+        &mut self,
+        p: [[f32; 3]; 4],
+        uv: [[f32; 2]; 4],
+        glint_uv: [[f32; 2]; 4],
+        armor: bool,
+    ) {
+        let marker = if armor { 4.0 } else { 2.0 };
+        for i in [0, 1, 2, 0, 2, 3] {
+            self.vertices.push(HudVertex {
+                pos: [p[i][0], p[i][1]],
+                uv: [uv[i][0] + marker, uv[i][1]],
+                color: u32::MAX,
+                depth: p[i][2],
+                glint_uv: glint_uv[i],
+                text: 0,
+            });
+        }
+    }
     /// Keep per-vertex depth for an orthographic GUI model, with +z toward the viewer.
     pub fn depth_since(&mut self, start: usize, clip: [f32; 4]) {
+        self.depth_glint_since(start, self.vertices.len(), clip);
+    }
+    /// `RenderPipelines.GLINT` after a GUI model: [`Self::depth_since`] for a model whose glint faces
+    /// ([`Self::quad_3d_glint`]) follow its own from `glint`: both share the
+    /// depth buffer, and the glint is drawn over the model in the same pass.
+    pub fn depth_glint_since(&mut self, start: usize, glint: usize, clip: [f32; 4]) {
+        let glint = glint.clamp(start, self.vertices.len());
         let vertices = &mut self.vertices[start..];
         if vertices.is_empty() {
             return;
@@ -1907,11 +1961,17 @@ impl HudBatch {
             v.depth = (max - v.depth) / (max - min).max(f32::EPSILON);
         }
         let [x0, y0, x1, y1] = clip.map(|v| (v * self.scale).max(0.0) as u32);
+        let clip = [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)];
         // Separate previews clear depth independently, even if their scissors match.
-        self.blends.push((
-            start as u32..self.vertices.len() as u32,
-            Blend::Depth([x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]),
-        ));
+        if glint > start {
+            self.blends
+                .push((start as u32..glint as u32, Blend::Depth(clip)));
+        }
+        let end = self.vertices.len();
+        if end > glint {
+            self.blends
+                .push((glint as u32..end as u32, Blend::DepthGlint(clip)));
+        }
     }
     pub fn rect_uv(&mut self, x: f32, y: f32, w: f32, h: f32, r: Rect, color: u32) {
         self.quad(
@@ -2525,6 +2585,8 @@ pub struct HudRenderer {
     invert_pipeline: Pipeline,
     additive_pipeline: Pipeline,
     depth_pipeline: Pipeline,
+    /// `RenderPipelines.GLINT` over a GUI model (`Blend::DepthGlint`).
+    depth_glint_pipeline: Pipeline,
     vignette_pipeline: Pipeline,
     end_portal_pipeline: Pipeline,
     /// The layout of `group`, which the CIT glint pipelines share.
@@ -2550,6 +2612,7 @@ impl HudRenderer {
         format: wgpu::TextureFormat,
         view: &wgpu::TextureView,
         glint_view: &wgpu::TextureView,
+        glint_armor_view: &wgpu::TextureView,
         glint_sampler: &wgpu::Sampler,
         coverage: bool,
     ) -> Result<Self> {
@@ -2624,6 +2687,16 @@ impl HudRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2654,6 +2727,10 @@ impl HudRenderer {
                     binding: 5,
                     resource: wgpu::BindingResource::Sampler(&linear_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(glint_armor_view),
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2663,7 +2740,8 @@ impl HudRenderer {
         });
         let attributes =
             wgpu::vertex_attr_array![0=>Float32x2,1=>Float32x2,2=>Unorm8x4,3=>Float32,4=>Float32x2];
-        let create = |label, blend, fragment_entry, depth: bool| {
+        // `depth`: the model's depth test, and whether the run writes depth.
+        let create = |label, blend, fragment_entry, depth: Option<bool>| {
             let desc = wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -2678,9 +2756,9 @@ impl HudRenderer {
                     })],
                 },
                 primitive: Default::default(),
-                depth_stencil: depth.then_some(wgpu::DepthStencilState {
+                depth_stencil: depth.map(|write| wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
+                    depth_write_enabled: Some(write),
                     depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: Default::default(),
                     bias: Default::default(),
@@ -2702,12 +2780,12 @@ impl HudRenderer {
             let source = wgpu::ShaderSource::Wgsl(include_str!("hud.wgsl").into());
             Pipeline::new(device, &desc, source, coverage).expect("the HUD's coverage")
         };
-        let pipeline = create("HUD", wgpu::BlendState::ALPHA_BLENDING, "fs_main", false);
+        let pipeline = create("HUD", wgpu::BlendState::ALPHA_BLENDING, "fs_main", None);
         let depth_pipeline = create(
             "HUD model",
             wgpu::BlendState::ALPHA_BLENDING,
             "fs_main",
-            true,
+            Some(true),
         );
         // BlendFunction.INVERT: ONE_MINUS_DST_COLOR, ONE_MINUS_SRC_COLOR,
         // ONE, ZERO.
@@ -2726,7 +2804,7 @@ impl HudRenderer {
                 },
             },
             "fs_crosshair",
-            false,
+            None,
         );
         // BlendFunction.ADDITIVE: ONE, ONE.
         let add = wgpu::BlendComponent {
@@ -2741,7 +2819,18 @@ impl HudRenderer {
                 alpha: add,
             },
             "fs_main",
-            false,
+            None,
+        );
+        // RenderPipelines.GLINT tests depth EQUAL and writes none; the faces are
+        // the model's own, so LEQUAL passes the same pixels.
+        let depth_glint_pipeline = create(
+            "HUD model glint",
+            wgpu::BlendState {
+                color: add,
+                alpha: add,
+            },
+            "fs_main",
+            Some(false),
         );
         // RenderPipelines.VIGNETTE: ZERO, ONE_MINUS_SRC_COLOR, ZERO, ONE.
         let vignette_pipeline = create(
@@ -2759,14 +2848,14 @@ impl HudRenderer {
                 },
             },
             "fs_vignette",
-            false,
+            None,
         );
         // RenderPipelines.END_PORTAL: opaque.
         let end_portal_pipeline = create(
             "HUD end portal",
             wgpu::BlendState::REPLACE,
             "fs_end_portal",
-            false,
+            None,
         );
         let capacity = 1 << 16;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2782,6 +2871,7 @@ impl HudRenderer {
             invert_pipeline,
             additive_pipeline,
             depth_pipeline,
+            depth_glint_pipeline,
             vignette_pipeline,
             end_portal_pipeline,
             layout,
@@ -3010,15 +3100,20 @@ impl HudRenderer {
         let mut at = 0;
         while at < runs.len() {
             let clip = match runs[at].1 {
-                Blend::Depth(clip) => Some(clip),
+                Blend::Depth(clip) | Blend::DepthGlint(clip) => Some(clip),
                 _ => None,
             };
-            let end = if clip.is_some() {
+            let end = if let Some(clip) = clip {
+                // The model's glint shares its pass and depth buffer.
                 at + 1
+                    + runs[at + 1..]
+                        .iter()
+                        .take_while(|(_, b)| *b == Blend::DepthGlint(clip))
+                        .count()
             } else {
                 runs[at..]
                     .iter()
-                    .position(|(_, b)| matches!(b, Blend::Depth(_)))
+                    .position(|(_, b)| matches!(b, Blend::Depth(_) | Blend::DepthGlint(_)))
                     .map_or(runs.len(), |n| at + n)
             };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3053,6 +3148,7 @@ impl HudRenderer {
                     Blend::Invert => &self.invert_pipeline,
                     Blend::Additive => &self.additive_pipeline,
                     Blend::Depth(_) => &self.depth_pipeline,
+                    Blend::DepthGlint(_) => &self.depth_glint_pipeline,
                     Blend::Vignette => &self.vignette_pipeline,
                     Blend::EndPortal => &self.end_portal_pipeline,
                     Blend::CitGlint(blend) => {
@@ -4591,6 +4687,44 @@ texture=wide",
                 .vertices
                 .iter()
                 .all(|v| v.depth.is_finite() && (0.0..=1.0).contains(&v.depth))
+        );
+    }
+
+    #[test]
+    fn a_gui_models_glint_follows_it_in_its_depth_pass() {
+        let mut batch = HudBatch::new([640, 480]);
+        batch.scale = 2.0;
+        let face = |z: f32| [[0.0, 0.0, z], [0.0, 1.0, z], [1.0, 1.0, z], [1.0, 0.0, z]];
+        let uv = [[0.25, 0.5]; 4];
+        let start = batch.vertices.len();
+        batch.quad_3d(face(1.0), uv, u32::MAX);
+        batch.quad_3d(face(3.0), uv, u32::MAX);
+        let glint = batch.vertices.len();
+        batch.quad_3d_glint(face(3.0), uv, [[7.0, 8.0]; 4], true);
+        batch.quad_3d_glint(face(1.0), uv, [[1.0, 2.0]; 4], false);
+        batch.depth_glint_since(start, glint, [1.0, 2.0, 4.0, 6.0]);
+        assert_eq!(
+            batch.runs(),
+            vec![
+                (0..12, Blend::Depth([2, 4, 6, 8])),
+                (12..24, Blend::DepthGlint([2, 4, 6, 8])),
+            ]
+        );
+        // The glint shares its face's depth, normalised with the model's.
+        assert_eq!(batch.vertices[12].depth, batch.vertices[6].depth);
+        assert_eq!(batch.vertices[18].depth, batch.vertices[0].depth);
+        // The shader picks the armour glint by u >= 4, the item's by u >= 2,
+        // and masks by the atlas UV under the marker.
+        assert_eq!(batch.vertices[12].uv, [4.25, 0.5]);
+        assert_eq!(batch.vertices[12].glint_uv, [7.0, 8.0]);
+        assert_eq!(batch.vertices[18].uv, [2.25, 0.5]);
+        // A model with no glint keeps a single depth run.
+        let start = batch.vertices.len();
+        batch.quad_3d(face(1.0), uv, u32::MAX);
+        batch.depth_glint_since(start, batch.vertices.len(), [1.0, 2.0, 4.0, 6.0]);
+        assert_eq!(
+            batch.runs().last(),
+            Some(&(24..30, Blend::Depth([2, 4, 6, 8])))
         );
     }
 
