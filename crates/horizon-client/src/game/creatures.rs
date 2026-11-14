@@ -576,7 +576,7 @@ impl Game<'_> {
     ) -> Option<u32> {
         self.spawn_mob_internal(kind, at, persistent, scripted, natural, true, yaw)
     }
-    fn spawn_mob_internal(
+    pub(super) fn spawn_mob_internal(
         &mut self,
         kind: &str,
         at: [f64; 3],
@@ -1580,28 +1580,26 @@ impl Game<'_> {
             self.split_sulfur_cube(m);
             return;
         }
-        // 🤖 Agent: AbstractCubeMob.getSplitCount: two to four smaller slimes.
         let size = m.extra.size;
         if size <= 1 {
             return;
         }
-        let mut n = 2 + self.world.random.next_int_bound(3).unwrap_or(0);
+        // The count (getSplitCount: two to four smaller slimes) and each child's yaw come from the
+        // dying cube's own random; the body goes with this call, so its copy draws what it would.
+        let mut own = m.random.clone();
+        let mut n = 2 + own.next_int_bound(3).unwrap_or(0);
         let mut cancel = false;
         let mut count = n as u32;
         let kind = super::native_hooks::mob_kind(m);
         self.native_mob_split(m.id, &kind, size, size / 2, &mut count, &mut cancel);
         n = if cancel { 0 } else { count.min(64) as _ };
         for k in 0..n {
-            let off = |kk: i32| (f64::from(kk % 2) - 0.5) * f64::from(size) / 4.0;
-            let at = [
-                m.position.x + off(k),
-                m.position.y + 0.5,
-                m.position.z + off(k / 2),
-            ];
-            if let Some(id) = self.spawn_mob_raw(&m.kind.id, at, m.persistent)
+            if let Some(id) = self.spawn_split_cube(m, k)
                 && let Some(c) = self.mobs.iter_mut().find(|c| c.id == id)
             {
+                // setUpSplitCube: setSize(halfSize, true), then snapTo with a yaw of its own.
                 horizon_client::mobs::cube::set_size(c, size / 2);
+                super::sulfur_cubes::snap_split_yaw(c, own.next_float() * 360.0);
             }
         }
     }
@@ -4249,7 +4247,7 @@ impl Game<'_> {
         }
     }
 
-    fn tick_projectiles(&mut self) -> Result<()> {
+    pub(super) fn tick_projectiles(&mut self) -> Result<()> {
         if self.creatures.projectiles.is_empty() {
             self.flush_lan_explosions();
             return self.flush_wind_bursts();
@@ -4498,8 +4496,8 @@ impl Game<'_> {
                     deflections.push(id);
                     continue;
                 }
-                // AbstractWindCharge.tick: out of the world's top it bursts.
-                if wind && keep && p.position.y > 350.0 {
+                // AbstractWindCharge.tick: above the world's top it bursts.
+                if wind && keep && super::wind::above_the_top(self.world.shape, p.position.y) {
                     hits.push((
                         p.clone(),
                         Hit::Block {
