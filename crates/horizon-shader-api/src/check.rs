@@ -6,12 +6,16 @@
 //! naga, checked against its signature and the API's rules (no bindings, no
 //! entry points, no `horizon_` names; in 0.2 none of the structs Horizon hands it
 //! constructed), then translated to SPIR-V, Metal and HLSL with its options at their
-//! defaults, minimums and maximums. A post stage of a pack with `[ray_tracing]` is checked
-//! twice: as every device runs it, where `trace` misses, and against the scene.
-use crate::inputs::{DISPLACEMENT_INPUT, Frame, RAY_HIT};
+//! defaults, minimums and maximums. A post stage of a pack with `[ray_tracing]`, and its
+//! material stage where that traces, is checked twice: as every device runs it, where `trace`
+//! misses, and against the scene.
+use crate::inputs::{COMPUTE_INPUT, DISPLACEMENT_INPUT, Frame, RAY_HIT};
 use crate::manifest::{OptionKind, PackOption};
 use crate::package::Pack;
-use crate::stages::{Composed, StageKind, compose, compose_scene};
+use crate::stages::{
+    Composed, GROUP, RAY_SCENE_BINDING, RAY_SPRITE_ARRAYS, RAY_SPRITES_BINDING, StageKind,
+    compose_traced, identifiers,
+};
 use naga::valid::{Capabilities, ModuleInfo, ValidationFlags, Validator};
 use std::collections::HashSet;
 use std::fmt;
@@ -63,14 +67,17 @@ pub struct CheckedStage {
     pub label: String,
     pub module: naga::Module,
     pub info: ModuleInfo,
-    /// A post stage of a pack with `[ray_tracing]`, built against the scene (`compose_scene`):
-    /// what the renderer runs while it binds the scene, on a device with ray queries. `module`
-    /// is the same stage with a `trace` that misses, which every device takes.
+    /// A post stage of a pack with `[ray_tracing]`, or its material stage where that calls
+    /// a trace function, built against the scene (`compose_scene`): what the renderer runs
+    /// while it binds the scene, on a device with ray queries. `module` is the same stage with a
+    /// `trace` that misses, which every device takes.
     pub scene: Option<naga::Module>,
     /// The stage's WGSL without the entry points (the prelude, the shared
     /// files, the file), for a renderer that calls the stage function from
     /// its own shader (the sky).
     pub source: String,
+    /// `source` built against the scene, with `scene`.
+    pub scene_source: Option<String>,
     /// What the budgets hold: with `scene`, its counts, the larger ones.
     pub expressions: usize,
     pub texture_reads: usize,
@@ -172,12 +179,23 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
         .chain(m.vertex.iter().map(|s| (StageKind::Vertex, s)))
         .chain(m.material.iter().map(|s| (StageKind::Material, s)))
         .chain(m.weather.iter().map(|s| (StageKind::Weather, s)))
-        .chain(m.post.iter().map(|s| (StageKind::Post, s)))
-        .chain(m.tonemap.iter().map(|s| (StageKind::Tonemap, s)))
-        .chain(m.entity.iter().map(|s| (StageKind::Entity, s)));
+        .map(|(kind, s)| (kind, s, None))
+        .chain(
+            (m.kept.before_world.iter().enumerate())
+                .map(|(i, s)| (StageKind::BeforeWorld, s, Some(i))),
+        )
+        .chain(m.post.iter().enumerate().map(|(i, s)| match s.compute {
+            true => (StageKind::Compute, s, Some(i)),
+            // In a pack without kept resources or compute passes an ordinary pass keeps the first
+            // entry with its file, as such packs were built before, so they compose
+            // byte-identically; with them, each entry's own `reads` decide its declarations.
+            false => (StageKind::Post, s, m.computes().then_some(i)),
+        }))
+        .chain(m.tonemap.iter().map(|s| (StageKind::Tonemap, s, None)))
+        .chain(m.entity.iter().map(|s| (StageKind::Entity, s, None)));
     let (mut checked, mut problems) = (Vec::new(), Vec::new());
-    for (kind, stage) in stages {
-        match check_stage(pack, kind, &stage.file) {
+    for (kind, stage, at) in stages {
+        match check_entry(pack, kind, &stage.file, at) {
             Ok(mut c) => {
                 c.label = stage.name.clone().unwrap_or_else(|| stage.file.clone());
                 checked.push(c);
@@ -236,9 +254,20 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
 
 /// Builds and checks one stage of `pack` from its file.
 pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedStage, Vec<Problem>> {
+    check_entry(pack, kind, file, None)
+}
+
+/// `check_stage` of the entry `at` of the stage's list (`stages::entry`): two `[[post]]`
+/// entries may share a file and differ in the rest.
+fn check_entry(
+    pack: &Pack,
+    kind: StageKind,
+    file: &str,
+    at: Option<usize>,
+) -> Result<CheckedStage, Vec<Problem>> {
     // First without the entry points, so a missing or mistyped stage function
     // is reported as such rather than as a call that doesn't resolve.
-    let mut own = compose(pack, kind, file);
+    let mut own = compose_traced(pack, kind, file, at, false);
     let entries = own.parts.pop().expect("entries are the last part");
     own.text.truncate(entries.1.start);
     if pack.manifest.ray_tracing.is_some() {
@@ -262,7 +291,7 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
                 p.message += "; the motion guide's names need `[motion]` in the manifest";
             }
         }
-        problems
+        undeclared(problems, &pack.manifest, kind)
     })?;
     own.text.truncate(entries.1.start);
     let mut problems = signature(&module, kind, file);
@@ -277,25 +306,38 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
         ));
     }
     problems.extend(api_rules(&module, kind, &own));
-    // 0.1's structs won't grow: it is retired when 0.2 is on by default.
-    if pack.manifest.api == crate::Api::V0_2 {
-        problems.extend(constructions(&module, &own));
-    }
+    problems.extend(constructions(&module, &own));
     problems.extend(options(&module, &pack.manifest.options, file));
     if !problems.is_empty() {
         return Err(problems);
     }
-    let composed = compose(pack, kind, file);
+    let composed = compose_traced(pack, kind, file, at, false);
     let module = parse(&composed)?;
     let info = validate(&module, &composed, Capabilities::default())?;
-    let scene = if kind == StageKind::Post && pack.manifest.ray_tracing.is_some() {
-        let composed = compose_scene(pack, kind, file);
-        let module = parse(&composed)?;
-        let capabilities = Capabilities::default() | Capabilities::RAY_QUERY;
-        let info = validate(&module, &composed, capabilities)?;
-        Some((module, info))
-    } else {
-        None
+    let problems = sampled_data(&module, &info, &composed, &pack.manifest);
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    // A stage the scene changes nothing in (a material stage that doesn't trace) is built once.
+    let traced =
+        Some(compose_traced(pack, kind, file, at, true)).filter(|s| s.text != composed.text);
+    let scene = match traced {
+        Some(mut composed) => {
+            let module = parse(&composed)?;
+            let capabilities = Capabilities::default() | Capabilities::RAY_QUERY;
+            let info = validate(&module, &composed, capabilities)?;
+            if kind == StageKind::Material {
+                let problems = vertex_rays(&module, &info, &composed, &pack.manifest);
+                if !problems.is_empty() {
+                    return Err(problems);
+                }
+            }
+            composed
+                .text
+                .truncate(composed.parts.last().expect("entries").1.start);
+            Some((module, info, composed.text))
+        }
+        None => None,
     };
     let (expressions, texture_reads) = cost(scene.as_ref().map_or(&module, |s| &s.0));
     let mut problems = Vec::new();
@@ -324,7 +366,7 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
     }
     let options = &pack.manifest.options;
     problems.extend(translate(&module, &info, options, file, (2, 2)));
-    if let (Some((module, info)), true) = (&scene, problems.is_empty()) {
+    if let (Some((module, info, _)), true) = (&scene, problems.is_empty()) {
         // Metal has ray queries from 2.4.
         problems.extend(translate(module, info, options, file, (2, 4)));
     }
@@ -337,8 +379,9 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
         label: file.to_owned(),
         module,
         info,
-        scene: scene.map(|s| s.0),
         source: own.text,
+        scene_source: scene.as_ref().map(|s| s.2.clone()),
+        scene: scene.map(|s| s.0),
         expressions,
         texture_reads,
     })
@@ -380,48 +423,139 @@ const RAY_QUERY_NAMES: [&str; 5] = [
 fn ray_queries(own: &Composed) -> Vec<Problem> {
     let mut problems = Vec::new();
     for (_, range) in &own.parts[1..] {
-        let text = &own.text[range.clone()];
-        let bytes = text.as_bytes();
-        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
         let mut seen: Vec<&str> = Vec::new();
-        let mut at = 0;
-        while at < bytes.len() {
-            if text[at..].starts_with("//") {
-                at += text[at..].find('\n').unwrap_or(text.len() - at);
-            } else if text[at..].starts_with("/*") {
-                let mut depth = 0;
-                while at < bytes.len() {
-                    let (opens, closes) =
-                        (text[at..].starts_with("/*"), text[at..].starts_with("*/"));
-                    depth += i32::from(opens) - i32::from(closes);
-                    // A character of any width: `at` stays on a boundary.
-                    at += match opens || closes {
-                        true => 2,
-                        false => text[at..].chars().next().map_or(1, char::len_utf8),
-                    };
-                    if depth == 0 {
-                        break;
-                    }
-                }
-            } else if word(bytes[at]) {
-                let end = at + bytes[at..].iter().take_while(|b| word(**b)).count();
-                let name = &text[at..end];
-                let query = RAY_QUERY_NAMES.contains(&name) || name.starts_with("rayQuery");
-                if query && !seen.contains(&name) {
-                    seen.push(name);
-                    problems.push(located(
-                        own,
-                        Some(range.start + at),
-                        format!(
-                            "`{name}`: a pack traces rays with `trace` and `trace_any`; ray queries and the scene are Horizon's"
-                        ),
-                    ));
-                }
-                at = end;
-            } else {
-                // A character of any width: `at` stays on a boundary.
-                at += text[at..].chars().next().map_or(1, char::len_utf8);
+        for (at, name) in identifiers(&own.text[range.clone()]) {
+            let query = RAY_QUERY_NAMES.contains(&name) || name.starts_with("rayQuery");
+            if query && !seen.contains(&name) {
+                seen.push(name);
+                problems.push(located(
+                    own,
+                    Some(range.start + at),
+                    format!(
+                        "`{name}`: a pack traces rays with `trace` and `trace_layers`; ray queries and the scene are Horizon's"
+                    ),
+                ));
             }
+        }
+    }
+    problems
+}
+
+/// A pass's prelude declares only the kept resources it lists, so naga finds no other: where the
+/// name it doesn't resolve is one, `problems` say so.
+fn undeclared(mut problems: Vec<Problem>, m: &crate::Manifest, kind: StageKind) -> Vec<Problem> {
+    let kept = |n: &str| {
+        (m.kept.resources.iter()).any(|r| r.name == n || format!("{}_previous", r.name) == n)
+    };
+    for p in &mut problems {
+        let name = (p
+            .message
+            .strip_prefix("no definition in scope for identifier: `"))
+        .and_then(|n| n.split('`').next())
+        .filter(|n| kept(n));
+        if let Some(name) = name {
+            p.message = match kind {
+                StageKind::Post | StageKind::Compute | StageKind::BeforeWorld => {
+                    format!(
+                        "`{name}` is a kept resource this pass doesn't list in `reads`/`writes`"
+                    )
+                }
+                _ => format!(
+                    "`{name}` is a kept resource, which the {} stage can't read yet",
+                    kind.name()
+                ),
+            };
+        }
+    }
+    problems
+}
+
+/// Where a pass samples or gathers a 32-bit kept texture (`r32float`, `rgba32float`; an
+/// `rgba32uint` one, `texture_2d<u32>`, can't be sampled at all), this
+/// frame's or `_previous`, itself or through a function's argument: the API reads them with
+/// `textureLoad` only, unfiltered, which every device does.
+fn sampled_data(
+    module: &naga::Module,
+    info: &ModuleInfo,
+    composed: &Composed,
+    m: &crate::Manifest,
+) -> Vec<Problem> {
+    use crate::kept::{Format, Shape};
+    let data = |name: &str| {
+        m.kept.resources.iter().any(|r| {
+            let wide = match r.shape {
+                Shape::Fixed { format, .. } | Shape::Scaled { format, .. } => {
+                    format != Format::Rgba16Float
+                }
+                Shape::Buffer { .. } => false,
+            };
+            wide && (r.name == name || format!("{}_previous", r.name) == name)
+        })
+    };
+    let mut names: Vec<&str> = (0..module.entry_points.len())
+        .flat_map(|i| &info.get_entry_point(i).sampling_set)
+        .filter_map(|key| module.global_variables[key.image].name.as_deref())
+        .filter(|n| data(n))
+        .collect();
+    names.sort();
+    names.dedup();
+    let first = |name: &str| {
+        (composed.parts[1..composed.parts.len() - 1].iter()).find_map(|(_, range)| {
+            let at = identifiers(&composed.text[range.clone()])
+                .into_iter()
+                .find(|w| w.1 == name)?;
+            Some(range.start + at.0)
+        })
+    };
+    (names.into_iter())
+        .map(|name| {
+            let message = format!(
+                "`{name}` is a 32-bit kept texture: read it with `textureLoad`, it isn't sampled \
+                 or gathered"
+            );
+            located(composed, first(name), message)
+        })
+        .collect()
+}
+
+/// Where a material stage built against the scene reaches it from a function that runs in a
+/// vertex shader: `displacement`, and the vertex stage's `vertex`, which shares its module. The
+/// renderer binds the scene for the fragment stage only.
+fn vertex_rays(
+    module: &naga::Module,
+    info: &ModuleInfo,
+    composed: &Composed,
+    manifest: &crate::manifest::Manifest,
+) -> Vec<Problem> {
+    let last = RAY_SPRITES_BINDING + RAY_SPRITE_ARRAYS - 1;
+    let scene: Vec<_> = (module.global_variables.iter())
+        .filter(|(_, g)| {
+            g.binding.as_ref().is_some_and(|b| {
+                b.group == GROUP && (RAY_SCENE_BINDING..=last).contains(&b.binding)
+            })
+        })
+        .map(|(handle, _)| handle)
+        .collect();
+    let vertex = [
+        ("vertex", manifest.vertex.is_some()),
+        ("displacement", manifest.displacement.is_some()),
+    ];
+    let mut problems = Vec::new();
+    for (handle, f) in module.functions.iter() {
+        let name = f.name.as_deref().unwrap_or_default();
+        if vertex.contains(&(name, true)) && scene.iter().any(|&g| !info[handle][g].is_empty()) {
+            let at = module
+                .functions
+                .get_span(handle)
+                .to_range()
+                .map(|r| r.start);
+            problems.push(located(
+                composed,
+                at,
+                format!(
+                    "`{name}` reaches a trace function: it runs in a vertex shader, and only `material` traces rays"
+                ),
+            ));
         }
     }
     problems
@@ -492,16 +626,17 @@ fn signature(module: &naga::Module, kind: StageKind, file: &str) -> Vec<Problem>
         .map(|a| type_name(module, a.ty))
         .collect();
     let result = f.result.as_ref().map(|r| type_name(module, r.ty));
-    if args == [kind.input().name] && result.as_deref() == Some(kind.output()) {
+    // A compute stage's function returns nothing: its output is "".
+    if args == [kind.input().name] && result.as_deref().unwrap_or_default() == kind.output() {
         return Vec::new();
     }
+    let result = result.map_or(String::new(), |r| format!(" -> {r}"));
     vec![problem(
         file,
         format!(
-            "`fn {}({}) -> {}` should be `{}`",
+            "`fn {}({}){result}` should be `{}`",
             kind.function(),
             args.join(", "),
-            result.as_deref().unwrap_or("()"),
             kind.signature()
         ),
     )]
@@ -607,7 +742,7 @@ fn api_rules(module: &naga::Module, kind: StageKind, own: &Composed) -> Vec<Prob
     problems
 }
 
-/// 0.2: the pack's files construct none of the structs Horizon hands a stage (`Frame`, the
+/// The pack's files construct none of the structs Horizon hands a stage (`Frame`, the
 /// stage inputs, the post helpers' `SurfaceData` and `RayHit`). They may gain fields, which would break a
 /// positional `PostInput(...)`; reading them and passing them along stay as they are. `Surface`,
 /// which `material` returns, is built.
@@ -618,6 +753,7 @@ fn constructions(module: &naga::Module, own: &Composed) -> Vec<Problem> {
         .chain([
             Frame::WGSL.name,
             DISPLACEMENT_INPUT.name,
+            COMPUTE_INPUT.name,
             "SurfaceData",
             RAY_HIT.name,
             "MotionData",
