@@ -11,7 +11,7 @@ use horizon_core::geometry::Aabb;
 const SHIFT: i32 = 3;
 
 #[derive(Default)]
-pub(super) struct ItemAreas {
+pub struct ItemAreas {
     /// The items in each cell, by index, in the list's order.
     cells: FxHashMap<[i32; 3], Vec<u32>>,
     /// What the cells were built from: the list's length, the last entity id
@@ -24,7 +24,7 @@ impl ItemAreas {
     /// Build the grid for villager item sensors only when many due sensors
     /// would otherwise repeatedly scan a large, spatially spread item list.
     /// Sampling a few 32-block columns avoids overhead for crowded piles.
-    pub(super) fn worthwhile(items: &[ItemEntity], queries: usize) -> bool {
+    pub fn worthwhile(items: &[ItemEntity], queries: usize) -> bool {
         if items.len() < 2048 || queries < 32 {
             return false;
         }
@@ -43,7 +43,7 @@ impl ItemAreas {
     }
 
     /// Whether an item of `items` may meet `area`: false only when none can.
-    pub(super) fn may_meet(&mut self, items: &[ItemEntity], next_entity: u32, area: Aabb) -> bool {
+    pub fn may_meet(&mut self, items: &[ItemEntity], next_entity: u32, area: Aabb) -> bool {
         self.build(items, next_entity);
         if self.cells.is_empty() {
             return false;
@@ -65,7 +65,7 @@ impl ItemAreas {
 
     /// A scan of `items` for `area`, which jumps over the items that can't
     /// meet it; empty when none can ([`Self::may_meet`] false).
-    pub(super) fn scan(&mut self, items: &[ItemEntity], next_entity: u32, area: Aabb) -> ItemScan {
+    pub fn scan(&mut self, items: &[ItemEntity], next_entity: u32, area: Aabb) -> ItemScan {
         let all = ItemScan {
             near: None,
             passed: 0,
@@ -119,7 +119,7 @@ impl ItemAreas {
 /// the next index to test, past the items that lie in cells the reach doesn't
 /// meet. Told of each item the walk removes, it keeps up; if the list changes
 /// any other way (an item joins), the walk tests every item from there on.
-pub(super) struct ItemScan {
+pub struct ItemScan {
     /// The items in the cells the reach meets, by index; `None`: every item.
     near: Option<Vec<usize>>,
     /// The first of `near` not yet passed.
@@ -130,11 +130,11 @@ pub(super) struct ItemScan {
 
 impl ItemScan {
     /// Whether no item can meet the reach.
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.near.as_ref().is_some_and(Vec::is_empty)
     }
     /// The first index from `j` the walk must test (`len` or more: done).
-    pub(super) fn next_from(&mut self, j: usize, len: usize) -> usize {
+    pub fn next_from(&mut self, j: usize, len: usize) -> usize {
         if len != self.len {
             self.near = None;
         }
@@ -147,7 +147,7 @@ impl ItemScan {
         near.get(self.passed).copied().unwrap_or(len).max(j)
     }
     /// The walk removed item `j`: the items after it moved down one.
-    pub(super) fn removed(&mut self, j: usize) {
+    pub fn removed(&mut self, j: usize) {
         self.len -= 1;
         if let Some(near) = &mut self.near {
             for i in near.iter_mut().filter(|i| **i > j) {
