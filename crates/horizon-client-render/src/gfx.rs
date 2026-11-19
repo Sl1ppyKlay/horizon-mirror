@@ -43,7 +43,7 @@ fn no_pack_hdr_gain(layered: bool, pack: bool, world: bool) -> bool {
     layered && !pack && world
 }
 
-fn terrain_shader() -> String {
+pub(in crate::gfx) fn terrain_shader() -> String {
     wgsl_prefix::HDR_LIGHT.to_owned() + include_str!("terrain.wgsl")
 }
 
@@ -1335,6 +1335,9 @@ pub struct Renderer {
     msaa: msaa::Msaa,
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
+    /// Watched only while HDR is On or Auto, including Auto in SDR; before `surface` and
+    /// `window`, so it's dropped first: its reader thread holds the surface.
+    display: Option<DisplayWatch>,
     /// The window's swapchain; `None` when rendering offscreen (`--offscreen`). Shared
     /// with frame generation's present thread while it runs.
     surface: Option<Arc<wgpu::Surface<'static>>>,
@@ -1364,9 +1367,6 @@ pub struct Renderer {
     pub last_wait: std::time::Duration,
     /// CPU time of the last `render`, waits excluded.
     pub last_encode: std::time::Duration,
-    /// Watched only while HDR is On or Auto, including Auto in SDR;
-    /// before `window`, so it's dropped first.
-    display: Option<DisplayWatch>,
     /// What this renderer's display last reported (`DisplayWatch`), its own: another
     /// renderer's watch never changes it.
     reading: output::DisplayReading,
@@ -1887,7 +1887,7 @@ fn adapter_requested_split(info: &wgpu::AdapterInfo, asked: Option<u32>, n: u32)
     asked.or((info.backend == wgpu::Backend::Metal).then(|| n.div_ceil(SPRITE_ARRAYS).max(512)))
 }
 /// The split the CPU mip chains are cut by before the adapter is known.
-fn sprite_split() -> u32 {
+pub(crate) fn sprite_split() -> u32 {
     requested_split().unwrap_or(SPRITE_SPLIT)
 }
 /// The block sprite layers per texture array on an adapter that holds
@@ -1914,7 +1914,7 @@ fn layer_split(
     Ok(split)
 }
 /// Sprite arrays terrain.wgsl binds (`sprites`, `sprites_1`...).
-const SPRITE_ARRAYS: u32 = 8;
+pub(crate) const SPRITE_ARRAYS: u32 = 8;
 /// The layers to give a square texture of `count` layers viewed as a 2D
 /// array. wgpu's OpenGL backend picks a texture's target from its layer
 /// count when it is created: one layer makes a 2D texture and a multiple of
@@ -4775,6 +4775,7 @@ impl Renderer {
     #[horizon_mod_api_macros::replaceable]
     pub fn release_surface(&mut self) {
         self.frame_gen.stop();
+        self.stop_display_reader();
         self.queue.wait();
         *self
             .spare_surface
@@ -4797,6 +4798,7 @@ impl Renderer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         self.frame_gen.stop_to_configure();
+        self.stop_display_reader();
         self.surface = None;
         let surface = match spare {
             Some(surface) => surface,
@@ -6095,7 +6097,12 @@ impl Renderer {
     ) -> std::result::Result<(), String> {
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        surface.configure(device, config);
+        {
+            let _queries = output_apply::SURFACE_QUERY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            surface.configure(device, config);
+        }
         let memory = pollster::block_on(memory.pop());
         if let Some(e) = memory.or(pollster::block_on(validation.pop())) {
             return Err(e.to_string());
@@ -6126,6 +6133,7 @@ impl Renderer {
         {
             log::warn!("Horizon renderer: the window surface did not configure ({e})");
             self.frame_gen.refused = true;
+            self.surface_refused();
         }
     }
     /// HDR calibration's test picture (`crate::hdr_calibration`) while it runs, else None.
@@ -9373,6 +9381,7 @@ impl Renderer {
                 sky_visible,
                 scene: self.ray_scene.as_ref(),
                 lightmap: &self.lightmap_pixels,
+                jitter: self.world_post.jitter_clip(),
             });
         }
         // One of Horizon's own packs: its shadow passes, from the shadow camera's lists.
@@ -10867,9 +10876,30 @@ impl Renderer {
                 device: &self.device,
                 encoder: &mut encoder,
                 world: (color, depth),
-                screen: &view_target,
                 size: self.world_post.size().unwrap_or([1, 1]),
+                window: [target_texture.width(), target_texture.height()],
                 scene: self.ray_scene.as_ref().map(|s| (s, frame.camera)),
+            });
+            // The engine's resolve of the pack's world goes here, between its chain and its
+            // output (#16126): the player's FXAA, at the world's size, where no chain draws
+            // the picture. TAA, its upscaling and sharpening stay off under every pack.
+            let resolved = (self.executor.is_some_and(|c| c.engine_fxaa)
+                && self.world_post.antialias)
+                .then(|| self.world_post.resolved(&self.device))
+                .flatten();
+            if let Some(resolved) = &resolved {
+                self.world_post.finish(
+                    &self.queue,
+                    &mut encoder,
+                    resolved,
+                    self.own_timing.as_mut(),
+                );
+            }
+            native.run_output(external::WorldOutput {
+                device: &self.device,
+                encoder: &mut encoder,
+                screen: &view_target,
+                resolved: resolved.as_ref(),
             });
         } else if let (Some((_, generated)), Some((_, depth))) = (&fg_frames, &scaled) {
             let camera = frame_gen::Camera {
@@ -13423,6 +13453,8 @@ struct DisplayWatch {
     /// Without Wayland's event, when to read wgpu's values again: the OS sends no event for
     /// a moved window or a changed SDR brightness slider.
     polled: Option<std::time::Instant>,
+    /// The thread that makes those reads for a window surface (`output_apply::DisplayReader`).
+    reader: Option<output_apply::DisplayReader>,
 }
 
 impl DisplayReading {
@@ -13475,6 +13507,7 @@ impl DisplayWatch {
             let watch = Self {
                 wayland: Some(wayland),
                 polled: None,
+                reader: None,
             };
             return (watch, wayland_reading(now));
         }
@@ -13485,6 +13518,7 @@ impl DisplayWatch {
             #[cfg(target_os = "linux")]
             wayland: None,
             polled: Some(std::time::Instant::now() + DISPLAY_POLL),
+            reader: None,
         };
         (watch, now)
     }
