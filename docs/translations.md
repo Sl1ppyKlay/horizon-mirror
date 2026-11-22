@@ -32,7 +32,7 @@ file, and `.github/workflows/crowdin.yml` is the whole sync:
 - a push to `main` that changes `en_us.json` uploads the English text, so a translator sees a new string the day it
   lands;
 - the nightly run (and a run by hand, which says which half to do) downloads two exports and opens one pull
-  request, `translations from Crowdin`: every translation into `l10n/game`, and the strings a proofreader approved
+  request, `tooling: translations from Crowdin`: every translation into `l10n/game`, and the strings a proofreader approved
   into `l10n/game-approved`. Neither folder is committed — `tools/crowdin_import.py` reads them, writes the lang
   files and the review record, and the workflow commits the result.
 
@@ -43,10 +43,22 @@ record of what the sync wrote last time lives in `tools/lang_review/crowdin/<cod
 own entries and leaves every entry a person put there by hand alone. The tool's own `--mark-reviewed` stays for
 wording that arrives through [#translations](https://discord.gg/playhorizon) instead.
 
-Two things the project does not check, so the import does:
+What the project does not check, the import does:
 
-- **Placeholders.** A translation whose `%s`/`%1$s` fields differ from the English text is dropped and reported; the
-  language keeps the text it had.
+- **Placeholders.** A translation the game cannot format (`%d`, `%q`, a `%` at the end: the game would show the
+  template as written), or that fills in other arguments than the English text, is dropped and reported; the
+  language keeps the text it had. `%s %s` and `%2$s %1$s` fill in the same two, so a translation may reorder them.
+  Where English writes a percent sign as `%%`, the translation still has to show one (`%%`, or a `%` that starts no
+  field, as in `50 %`). The keys whose English text is read as plain text and never formatted are listed in
+  `tools/lang_unformattable.json`, a list that may only shrink: a Python and a Rust test pin its exact keys, so adding
+  one means changing reviewed test code, and the Rust test fails once a listed key's English formats.
+- **Control characters.** A translation that carries a control character is dropped and reported: a line break is
+  fine, a tab or a bidi embedding, override or isolate control only where its English text has one.
+- **Broken exports.** An export file that names no language the table knows, or a second file for the same
+  language, in either download fails the run before anything is written, and so does an export that is not a flat
+  map of key to text, repeats a key, is larger than 4 MiB (no more is read) or holds a string longer than 4,096
+  characters; the message names the language and the file. An empty file or `[]` is a language with nothing
+  exported.
 - **Untranslated strings.** Crowdin writes the English sentence into a string nobody translated unless the export
   skips them; both downloads ask it to skip (`skip_untranslated_strings`), and the import drops a value that is the
   English text unless the lang file already holds exactly that. A language whose word really is the English one
@@ -106,7 +118,8 @@ get in and where a single wrong string is still reported.
   and a new game string falls back to English where a language lacks it. A machine translation is fine for both: it
   starts unreviewed by itself.
 - Keep placeholders as they are (`%s`, `%1$s` in the game, `{name}` in the launcher): `lang_coverage.py` reports a
-  changed one, and the Crowdin import refuses to write it.
+  changed one, the Crowdin import refuses to write it, and `lang.rs`'s test fails on a bundled one. Both read
+  templates the way the game's formatter does (`tests/fixtures/translation_templates.json` holds the cases they share).
 
 ## How the first record was made
 
