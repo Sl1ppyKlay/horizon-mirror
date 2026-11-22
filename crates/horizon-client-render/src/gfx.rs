@@ -352,6 +352,15 @@ fn translucent_pulled(info: &wgpu::AdapterInfo, multi_draw: bool, flat_page_grou
     info.backend == wgpu::Backend::Gl && !multi_draw && flat_page_groups
 }
 
+/// Whether the adapter is one of Apple's tiled GPUs: the only ones where a
+/// discard costs hidden-surface removal enough to split solid terrain into
+/// opaque and cutout passes. Metal is just the API on a Mac — Intel and AMD
+/// Macs use it too, with no tiled-memory discard penalty. `graphics::lod_capped`
+/// names Apple's GPUs this way already because Metal reports no PCI vendor.
+fn tiled_solid_gpu(info: &wgpu::AdapterInfo) -> bool {
+    info.backend == wgpu::Backend::Metal && info.name.starts_with("Apple")
+}
+
 /// The vertices flat draws bind for a call's page key: a page of the section arena, or of
 /// the translucent arena up to its last range in use (`flat::TRANSLUCENT_KEYS`).
 fn flat_vertices<'a>(
@@ -4314,9 +4323,10 @@ impl Renderer {
             .flags
             .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
         let flat_wanted = flat::wanted(&adapter, &device);
-        // Metal draws solid terrain in two passes (`split_solid`): meshes put all
-        // their opaque quads first, so each pass draws its part in a run or two.
-        crate::mesher::group_parts(adapter.get_info().backend == wgpu::Backend::Metal);
+        // Apple's tiled GPUs draw solid terrain in two passes (`split_solid`):
+        // meshes put all their opaque quads first, so each pass draws its part
+        // in a run or two. Other Metal devices (Intel, AMD) draw one pass.
+        crate::mesher::group_parts(tiled_solid_gpu(&adapter.get_info()));
         // Readable as storage where flat draws run: a shader pack's terrain program reads them.
         let arena = arena::Arena::new(
             &device,
@@ -4533,7 +4543,7 @@ impl Renderer {
             .and_then(|depth_test| {
                 let mut cull = cull::Cull::new(&device, frame_format, depth_test)?;
                 cull.always = cull_env.as_deref() == Ok("all");
-                if !cull.always && adapter_info.backend == wgpu::Backend::Metal {
+                if !cull.always && tiled_solid_gpu(&adapter_info) {
                     cull.min_sections = cull::TILED_MIN_SECTIONS;
                 }
                 Some(cull)
@@ -6210,16 +6220,17 @@ impl Renderer {
             flat.set_translucent_page_vertices(arena.page_vertices());
         }
     }
-    /// Uploads solid quads in the compact layout (`packed_quads`) unless a pack reads the
-    /// arena's vertices as `TerrainVertex`es: a `shaders/` pack's terrain and shadow
-    /// programs outside flat draws (flat ones unpack the records, `pack_atlas::PULL_FLAT`).
+    /// Uploads solid quads in the compact layout (`packed_quads`) unless a non-native `shaders/`
+    /// pack is active: packed sections skip `arena::write_sources` (`p.sources` is sized for 4-slot
+    /// unpacked quads and `pack_atlas.rs` indexes `hz_sources` by `gl_VertexIndex / 4u`), which
+    /// leaves `mc_Entity = -1` and `at_midBlock = 0` on packed chunks (#19558).
     /// Leaving it drops every section and far tile for the game to mesh again.
     fn follow_packed_layout(&mut self) {
         if self.world_held {
             return;
         }
         let pack = self.pack_post.as_ref().and_then(|p| p.1.as_ref()).is_some();
-        let want = self.flat.is_some() && (!pack || self.pack_terrain_flat) && self.packed_on;
+        let want = want_packed_layout(self.flat.is_some(), pack, self.packed_on);
         if want == self.packed_quads {
             return;
         }
@@ -8669,11 +8680,11 @@ impl Renderer {
         self.phase2_pages.clear();
         self.solid_runs.clear();
         self.phase2_runs.clear();
-        // On Metal, phase 1 goes the opaque quads of every list, then the cutout
-        // ones (`Part`), each solid pass drawing its own: `[..opaque_draws]`,
-        // then the rest; phase 2 likewise. A fading list's quads all draw in the
-        // cutout pass.
-        let split_solid = self.info.backend == wgpu::Backend::Metal && !msaa_on;
+        // On Apple's tiled GPUs, phase 1 goes the opaque quads of every list,
+        // then the cutout ones (`Part`), each solid pass drawing its own:
+        // `[..opaque_draws]`, then the rest; phase 2 likewise. A fading list's
+        // quads all draw in the cutout pass.
+        let split_solid = tiled_solid_gpu(&self.info) && !msaa_on;
         let parts = |fading: bool| -> &'static [(u8, Quads)] {
             match (split_solid, fading) {
                 (false, _) => &[(0, Quads::All)],
@@ -10056,7 +10067,8 @@ impl Renderer {
         if oit_on && let Some(oit) = &mut self.oit {
             oit.prepare(
                 &self.device,
-                &self.queue,
+                &mut self.uploads,
+                &mut encoder,
                 &views.primary().projection,
                 [water_mask_quads > 0, cloud_quads > 0],
             );
@@ -10326,7 +10338,7 @@ impl Renderer {
         // Two solid passes only where a discard costs the GPU its hidden surface
         // removal: Apple's tiled GPUs, behind Metal. Elsewhere the second pass
         // would double the solid draw calls and vertex work for nothing.
-        let split_solid = self.info.backend == wgpu::Backend::Metal && !msaa_on;
+        let split_solid = tiled_solid_gpu(&self.info) && !msaa_on;
         let translucent_pipeline = material.map_or(&self.translucent, |m| m.translucent);
         let pack_flat = material.and_then(|m| m.flat);
         let pack_flat_msaa = material
@@ -11650,9 +11662,9 @@ impl Renderer {
             let engine_resolve = self.executor.is_some_and(|c| c.engine_resolve);
             let taa_resolved = engine_resolve
                 .then(|| {
-                    (self.world_post).resolve_taa(
+                    (self.world_post).resolve_taa_staged(
                         &self.device,
-                        &self.queue,
+                        &mut self.uploads,
                         &mut encoder,
                         self.own_timing.as_mut(),
                     )
@@ -11662,8 +11674,12 @@ impl Renderer {
                 let fxaa = (engine_resolve && self.world_post.antialias)
                     .then(|| self.world_post.resolved(&self.device))
                     .flatten()?;
-                self.world_post
-                    .finish(&self.queue, &mut encoder, &fxaa, self.own_timing.as_mut());
+                self.world_post.finish(
+                    &mut self.uploads,
+                    &mut encoder,
+                    &fxaa,
+                    self.own_timing.as_mut(),
+                );
                 Some(fxaa)
             });
             native.run_output(external::WorldOutput {
@@ -11699,7 +11715,7 @@ impl Renderer {
             fg_made = self.draw_generated(&mut encoder, frame, &camera, &overlay, onto);
         } else if scaled.is_some() {
             self.world_post.finish(
-                &self.queue,
+                &mut self.uploads,
                 &mut encoder,
                 &view_target,
                 self.own_timing.as_mut(),
@@ -11707,36 +11723,38 @@ impl Renderer {
         }
         if !frame.title {
             self.draw_world_views(&mut encoder, frame, globals, flat_frame, entity_quads);
-            let (depth, depth_size) = match &scaled {
-                Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
-                None => (self.depth.as_ref().expect(WINDOW_DEPTH), size),
-            };
-            native_render::world_drawn(&mut native_render::WorldDrawn {
-                device: &self.device,
-                queue: &self.queue,
-                encoder: &mut encoder,
-                color: &target_texture,
-                color_view: &view_target,
-                color_format: self.output.frame.overlay_format,
-                size,
-                depth,
-                depth_size,
-                view_proj,
-                jittered,
-                camera: frame.camera,
-                entities: frame.entities,
-                spans: frame.entity_spans,
-                motion: frame.entity_motion,
-                atlas: self.hud.atlas_texture.as_ref(),
-                quad_indices: &self.indices,
-                block_sprites: native_render::BlockSpriteArrays {
-                    views: &self.sprite_views,
-                    split: self.sprite_split,
-                    size: self.sprite_textures[0].width(),
-                    nearest: &self.sprite_nearest,
-                    filtered: &self.sprite_sampler,
-                },
-            });
+            if native_render::world_drawn_hooked() {
+                let (depth, depth_size) = match &scaled {
+                    Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
+                    None => (self.depth.as_ref().expect(WINDOW_DEPTH), size),
+                };
+                native_render::world_drawn(&mut native_render::WorldDrawn {
+                    device: &self.device,
+                    queue: &self.queue,
+                    encoder: &mut encoder,
+                    color: &target_texture,
+                    color_view: &view_target,
+                    color_format: self.output.frame.overlay_format,
+                    size,
+                    depth,
+                    depth_size,
+                    view_proj,
+                    jittered,
+                    camera: frame.camera,
+                    entities: frame.entities,
+                    spans: frame.entity_spans,
+                    motion: frame.entity_motion,
+                    atlas: self.hud.atlas_texture.as_ref(),
+                    quad_indices: &self.indices,
+                    block_sprites: native_render::BlockSpriteArrays {
+                        views: &self.sprite_views,
+                        split: self.sprite_split,
+                        size: self.sprite_textures[0].width(),
+                        nearest: &self.sprite_nearest,
+                        filtered: &self.sprite_sampler,
+                    },
+                });
+            }
         }
         // A 0.2 pack in SDR: its picture finishes on 8 bits before the hand, the camera overlays
         // and the HUD draw over it (`overlay_format`).
@@ -11820,9 +11838,12 @@ impl Renderer {
             .filter(|_| self.surface.is_some())
             .map(|f| &f.0));
         match (&self.hdr, shown) {
-            (Some(hdr), Some(texture)) => {
-                hdr.present(&self.queue, &mut encoder, texture, self.own_timing.as_mut())
-            }
+            (Some(hdr), Some(texture)) => hdr.present_staged(
+                &mut self.uploads,
+                &mut encoder,
+                texture,
+                self.own_timing.as_mut(),
+            ),
             // Offscreen nothing shows HDR: the target gets the frame as SDR shows it, for
             // splitscreen's compositor.
             (Some(_), None) => {
@@ -12083,7 +12104,7 @@ impl Renderer {
         // world (`Hdr::layered`).
         let layered = self.hdr.as_ref().is_some_and(|h| h.layered());
         if let Some(hdr) = &self.hdr {
-            hdr.begin(&self.queue, !frame.title);
+            hdr.begin_staged(&mut self.uploads, encoder, !frame.title);
         }
         if overlay.hand_quads > 0 {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
@@ -12116,7 +12137,7 @@ impl Renderer {
             pass.draw_indexed(0..overlay.hand_quads * 6, overlay.first_hand_vertex, 0..1);
         }
         // A native mod's turn after the hand, on the real frame only.
-        if overlay.real && !frame.title {
+        if overlay.real && !frame.title && native_render::hand_drawn_hooked() {
             native_render::hand_drawn(&mut native_render::HandDrawn {
                 device: &self.device,
                 queue: &self.queue,
@@ -12580,9 +12601,21 @@ fn facing_runs_from(
 #[cfg(test)]
 mod frame_policy_tests;
 
+fn want_packed_layout(has_flat: bool, has_pack: bool, packed_on: bool) -> bool {
+    has_flat && !has_pack && packed_on
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_native_shader_pack_disables_packed_layout() {
+        assert!(want_packed_layout(true, false, true));
+        assert!(!want_packed_layout(true, true, true));
+        assert!(!want_packed_layout(false, false, true));
+        assert!(!want_packed_layout(true, false, false));
+    }
     /// #16769: a graphics driver that never answers the device search must end the
     /// start with a message, not hold it on the boot screen forever.
     #[test]
@@ -12850,6 +12883,29 @@ mod tests {
         assert!(batchable(&metal, true));
         assert!(!batchable(&vulkan, false));
         assert!(!batchable(&gl, true));
+    }
+
+    /// The two solid passes and the tiled culling gate are for Apple's GPUs only:
+    /// Metal is merely the API on an Intel or AMD Mac, which has no tiled-memory
+    /// discard penalty. The name is the discriminator Metal leaves us, the same
+    /// one `graphics::lod_capped` uses.
+    #[test]
+    fn tiled_solid_passes_are_for_apple_gpus_on_metal_only() {
+        let metal = |name: &str| {
+            let mut info = adapter(wgpu::DeviceType::IntegratedGpu);
+            info.backend = wgpu::Backend::Metal;
+            info.name = name.into();
+            info
+        };
+        let tiled = super::tiled_solid_gpu;
+        assert!(tiled(&metal("Apple M4 Pro")));
+        assert!(tiled(&metal("Apple M1")));
+        assert!(!tiled(&metal("Intel(R) Iris(R) Pro Graphics 655")));
+        assert!(!tiled(&metal("Intel Iris Xe Graphics")));
+        assert!(!tiled(&metal("AMD Radeon Pro 560")));
+        let mut vulkan = metal("Apple M4 Pro");
+        vulkan.backend = wgpu::Backend::Vulkan;
+        assert!(!tiled(&vulkan));
     }
 
     /// #18478: translucent sections read the arena page only on OpenGL without indirect

@@ -203,13 +203,6 @@ pub trait LodSampler: Send {
     fn reduced_column(&mut self, x: i32, z: i32, _width: i32) -> crate::lod::Column {
         self.column(x, z)
     }
-    /// Whether a column since the last call was left empty because its data
-    /// is still on its way (a BlueMap tile downloading, nothing coarser to
-    /// stand in): that sample isn't drawn, what it would replace is
-    /// (`Lod::finish_any_sample`), and it is taken again later.
-    fn waited(&mut self) -> bool {
-        false
-    }
     /// `side` x `side` columns from (`x`, `z`), `stride` blocks apart; none
     /// when sampling failed and should be tried again later.
     fn grid(&mut self, x: i32, z: i32, stride: i32, side: usize) -> Vec<crate::lod::Column> {
@@ -748,6 +741,9 @@ pub struct Streaming {
     /// The columns and the next row the band's decoration ranks were given
     /// for (`set_band`).
     band_ranked: Option<(i32, i32, i32)>,
+    /// Cached face visibility and scratch buffers for synchronous edit meshing (`mesh_immediate`).
+    immediate_faces: Faces,
+    immediate_scratch: MeshScratch,
 }
 /// Snapshot only after a scan found no missing candidates. Public range fields
 /// and `World::chunks` can change without going through Streaming, so compare
@@ -1198,12 +1194,14 @@ mod queue_census;
 pub use queue_census::QueueCensus;
 mod forced_cover;
 mod forced_ring;
+pub mod immediate_mesh;
 mod mesh_job;
 mod relight_now;
 mod viewed_meshing;
 use bounded::nearest_first;
 use dynamic_emission::light_region_ready;
 use forced_cover::ForcedCover;
+pub use immediate_mesh::IMMEDIATE_MESH_LIMIT;
 use mesh_job::{Faces, mesh_section};
 pub use viewed_meshing::{
     MAX_VIEWED_SECTIONS, MeshSource, VIEWED_LINGER, VIEWED_MESH_WORKERS, VIEWED_UPLOADS_PER_FRAME,
@@ -1326,6 +1324,8 @@ impl Streaming {
             mesh: true,
             band: None,
             band_ranked: None,
+            immediate_faces: None,
+            immediate_scratch: MeshScratch::default(),
         }
     }
     /// Shares generation resources, but gives distant work its own worker state.
@@ -2326,6 +2326,7 @@ impl Streaming {
         // A server draws nothing: its sections are never meshed.
         if !self.mesh {
             world.dirty_sections.clear();
+            world.immediate_sections.clear();
             self.cover_current = false;
             self.light_scratch = light;
             self.gone_scratch = gone;
@@ -2849,6 +2850,24 @@ impl Streaming {
             self.mod_tickets.insert(ticket)
         } else {
             self.mod_tickets.remove(&ticket)
+        };
+        if self.settle(chunk) {
+            self.rank_forced(chunk.0, chunk.1, chunk.0, chunk.1);
+        }
+        changed
+    }
+    /// Hold or release a runtime-only mod ticket ([`TransientTicket`]), as
+    /// [`Self::set_mod_forced`] does a saved one: true when it changed.
+    pub fn set_transient_forced(
+        &mut self,
+        ticket: crate::mod_chunk_tickets::TransientTicket,
+        forced: bool,
+    ) -> bool {
+        let chunk = ticket.chunk;
+        let changed = if forced {
+            self.mod_tickets.insert_transient(ticket)
+        } else {
+            self.mod_tickets.remove_transient(&ticket)
         };
         if self.settle(chunk) {
             self.rank_forced(chunk.0, chunk.1, chunk.0, chunk.1);
